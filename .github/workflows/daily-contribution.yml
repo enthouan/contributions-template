@@ -1,0 +1,51 @@
+name: Daily contribution safety net
+
+on:
+  # Scheduled runs are opt-in for generated output repos. Uncomment this single
+  # daily cron after configuring repository variables and secrets.
+  # schedule:
+  #   - cron: "5 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-contribution-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  daily-contribution:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check contribution calendar
+        id: daily
+        env:
+          CONTRIBUTION_AUTHOR_EMAIL: ${{ vars.CONTRIBUTION_AUTHOR_EMAIL }}
+          CONTRIBUTION_AUTHOR_NAME: ${{ vars.CONTRIBUTION_AUTHOR_NAME }}
+          CONTRIBUTION_LOCATION: ${{ vars.CONTRIBUTION_LOCATION || 'Local' }}
+          CONTRIBUTION_LOGIN: ${{ vars.CONTRIBUTION_LOGIN || github.repository_owner }}
+          CONTRIBUTION_TIMEZONE: ${{ vars.CONTRIBUTION_TIMEZONE || 'America/Los_Angeles' }}
+          GH_CONTRIBUTIONS_TOKEN: ${{ secrets.GH_CONTRIBUTIONS_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/daily_contribution.py
+
+      - name: Commit safety-net activity
+        if: steps.daily.outputs.changed == 'true'
+        env:
+          AUTHOR_DATE: ${{ steps.daily.outputs.author_date }}
+          AUTHOR_EMAIL: ${{ steps.daily.outputs.author_email }}
+          AUTHOR_NAME: ${{ steps.daily.outputs.author_name }}
+          RECORD_DATE: ${{ steps.daily.outputs.date }}
+          RECORD_PATH: ${{ steps.daily.outputs.path }}
+        run: |
+          git config user.name "$AUTHOR_NAME"
+          git config user.email "$AUTHOR_EMAIL"
+          git add -- "$RECORD_PATH"
+          GIT_AUTHOR_DATE="$AUTHOR_DATE" GIT_COMMITTER_DATE="$AUTHOR_DATE" \
+            git commit --no-gpg-sign -m "Record activity $RECORD_DATE"
+          git push

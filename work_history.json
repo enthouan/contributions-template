@@ -1,0 +1,41 @@
+{
+  "source": "Example work-history notes. Replace with your own roles before generation.",
+  "entries": [
+    {
+      "slug": "state-university",
+      "type": "education",
+      "organization": "State University",
+      "title": "Computer Science Student",
+      "location": "Example City",
+      "start": "2010-01-03",
+      "end": "2013-12-31"
+    },
+    {
+      "slug": "first-startup",
+      "type": "experience",
+      "organization": "First Startup",
+      "title": "Software Engineer",
+      "location": "Example City",
+      "start": "2014-01-01",
+      "end": "2016-12-31"
+    },
+    {
+      "slug": "product-team",
+      "type": "experience",
+      "organization": "Product Team",
+      "title": "Senior Software Engineer",
+      "location": "Example City",
+      "start": "2017-01-01",
+      "end": "2020-12-31"
+    },
+    {
+      "slug": "platform-team",
+      "type": "experience",
+      "organization": "Platform Team",
+      "title": "Engineering Manager",
+      "location": "Example City",
+      "start": "2021-01-01",
+      "end": "2024-06-30"
+    }
+  ]
+}
