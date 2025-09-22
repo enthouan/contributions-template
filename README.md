@@ -348,6 +348,10 @@ YYYY/MM/DD.jsonl
 
 Each commit uses local timestamps based on `travel_history.json`.
 
+Busy years also get a few deterministic 10-12 commit burst days. Those spikes
+are created by redistributing commits from nearby normal days, so yearly totals
+stay stable instead of being inflated.
+
 The generator also emits retrospective `work_history.json` and
 `travel_history.json` snapshots. Job and travel-history notes appear a few days
 after the relevant role or trip ends, rather than appearing in very old commits

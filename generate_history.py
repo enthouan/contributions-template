@@ -50,6 +50,9 @@ COMMIT_TIMES = [
     time(20, 26),
     time(21, 49),
     time(22, 12),
+    time(22, 47),
+    time(23, 11),
+    time(23, 34),
 ]
 ANNUAL_TOTAL_TARGETS = {
     2021: 240,
@@ -459,6 +462,149 @@ def annual_quota_counts(
     return counts
 
 
+def annual_burst_count(year: int, generated_total: int, existing_total: int) -> int:
+    if generated_total < 200:
+        return 0
+    graph_total = generated_total + existing_total
+    if graph_total < 220:
+        return 0
+    if graph_total >= 500:
+        return 5
+    if graph_total >= 350:
+        return 4
+    return 3
+
+
+def burst_candidate_sort_key(day: date) -> tuple[int, int]:
+    weekday_penalty = {
+        1: 0,
+        2: 0,
+        3: 0,
+        4: 0,
+        6: 220_000,
+        0: 420_000,
+        5: 620_000,
+    }[day.weekday()]
+    return weekday_penalty, stable_int(day.isoformat(), "annual-burst-candidate", 1_000_000)
+
+
+def select_burst_days(candidates: list[date], target: int) -> list[date]:
+    selected: list[date] = []
+    candidates = sorted(candidates, key=burst_candidate_sort_key)
+    for minimum_gap in (28, 21, 14, 7, 0):
+        for day in candidates:
+            if day in selected:
+                continue
+            if minimum_gap and any(abs((day - existing).days) < minimum_gap for existing in selected):
+                continue
+            selected.append(day)
+            if len(selected) == target:
+                return sorted(selected)
+    return sorted(selected)
+
+
+def redistribute_for_burst(counts: dict[date, int], burst_day: date, target_count: int) -> bool:
+    needed = target_count - counts[burst_day]
+    if needed <= 0:
+        return True
+
+    year = burst_day.year
+    burst_era = era_for(burst_day)
+    donors = [
+        day
+        for day, count in counts.items()
+        if day.year == year
+        and era_for(day) == burst_era
+        and day != START
+        and day != END
+        and day != burst_day
+        and count > 1
+    ]
+    donors.sort(
+        key=lambda day: (
+            abs((day - burst_day).days),
+            stable_int(day.isoformat(), f"annual-burst-donor:{burst_day.isoformat()}", 1_000_000),
+        )
+    )
+
+    for donor in donors:
+        if needed == 0:
+            break
+        available = counts[donor] - 1
+        moved = min(available, needed)
+        counts[donor] -= moved
+        counts[burst_day] += moved
+        needed -= moved
+
+    if needed == 0:
+        return True
+
+    fallback_donors = [
+        day
+        for day, count in counts.items()
+        if day.year == year
+        and era_for(day) == burst_era
+        and day != START
+        and day != END
+        and day != burst_day
+        and count > 0
+    ]
+    fallback_donors.sort(
+        key=lambda day: (
+            abs((day - burst_day).days),
+            stable_int(day.isoformat(), f"annual-burst-fallback:{burst_day.isoformat()}", 1_000_000),
+        )
+    )
+    for donor in fallback_donors:
+        if needed == 0:
+            break
+        counts[donor] -= 1
+        counts[burst_day] += 1
+        needed -= 1
+
+    return needed == 0
+
+
+def apply_annual_bursts(
+    counts: dict[date, int],
+    existing: dict[str, int],
+    travel: dict,
+    start: date,
+    end: date,
+) -> dict[date, int]:
+    adjusted = dict(counts)
+    years = sorted({day.year for day in adjusted} | {parse_day(day).year for day in existing})
+
+    for year in years:
+        generated_total = sum(count for day, count in adjusted.items() if day.year == year)
+        existing_total = sum(count for day, count in existing.items() if parse_day(day).year == year)
+        burst_target = annual_burst_count(year, generated_total, existing_total)
+        if burst_target == 0:
+            continue
+
+        year_start = max(start, date(year, 1, 1))
+        year_end = min(end, date(year, 12, 31))
+        candidates = [
+            day
+            for day in each_day(year_start, year_end)
+            if adjusted.get(day, 0) >= 2
+            and adjusted.get(day, 0) < 10
+            and day != START
+            and day != END
+            and existing.get(day.isoformat(), 0) == 0
+            and travel_skip_reason(travel, day) is None
+            and vacation_slowdown_reason(travel, day) is None
+            and holiday_slowdown_reason(day) is None
+        ]
+        selected = select_burst_days(candidates, burst_target)
+
+        for burst_day in selected:
+            target_count = choose_count(burst_day, "annual-burst-target", 10, 12)
+            redistribute_for_burst(adjusted, burst_day, target_count)
+
+    return {day: count for day, count in adjusted.items() if count > 0}
+
+
 def claude_monthly_vacation_days(
     start: date,
     end: date,
@@ -510,6 +656,7 @@ def plan_commits(
     travel: dict,
 ) -> tuple[list[PlannedCommit], Counter, Counter]:
     planned: list[PlannedCommit] = []
+    planned_counts: dict[date, int] = {}
     skip_reasons: Counter = Counter()
     real_active_skips: Counter = Counter()
     annual_counts = annual_quota_counts(start, end, existing, travel)
@@ -543,7 +690,16 @@ def plan_commits(
             real_active_skips[era] += 1
         if count == 0:
             continue
+        planned_counts[day] = count
 
+    planned_counts = apply_annual_bursts(planned_counts, existing, travel, start, end)
+
+    for day in each_day(start, end):
+        count = planned_counts.get(day, 0)
+        if count == 0:
+            continue
+        era = era_for(day)
+        existing_count = existing.get(day.isoformat(), 0)
         location, timezone = location_for(travel, day)
         roles = active_roles(work_history, day)
         for sequence in range(1, count + 1):
