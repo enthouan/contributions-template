@@ -7,38 +7,37 @@ This repo is the reusable template and setup guide. Keep it as a small tooling
 repo. The generated contribution history should live in a separate empty private
 repository, for example `yourname/contributions`.
 
-## The 3 Things You Need
+## How To Set Up This Repo
 
-1. **Personal timeline config**
-   - `work_history.json`: school, jobs, roles, and major career eras.
-   - `travel_history.json`: location ranges, exact travel days, vacation
-     ranges, and timezones.
+This template is the tooling source. The generated contribution history should
+be imported into a separate empty private repository.
 
-2. **Real contribution baseline**
-   - `existing_contributions.json`: days where GitHub already shows real
-     activity, so generated commits can skip or reduce those dates.
+The clean path is:
 
-3. **An empty private output repo**
-   - This is where the generated `YYYY/MM/DD.jsonl` history is imported and
-     pushed.
-   - Do not use the template repo itself as the generated output repo.
+1. Prepare a clean output repo.
+2. Build your personal timeline config.
+3. Generate and push the initial history.
+4. Enable the daily safety net.
 
-## Recommended Setup
+### Step 1: Prepare A Clean Output Repo
 
-Create two local folders:
+Create or clone two repositories locally:
 
 ```text
-contributions-template   # this tooling/config repo
-contributions            # empty private output repo with generated history
+contributions-template   # this template/tooling repo
+contributions            # empty private output repo
 ```
 
-Clone or create the empty output repo:
+The output repo should be newly created on GitHub as a private repo with no
+README, license, `.gitignore`, or initial commit. Then clone it next to this
+template repo:
 
 ```sh
 git clone git@github.com:YOUR_LOGIN/contributions.git ../contributions
 ```
 
-Copy the template files into the empty output repo:
+Copy the template files into the output repo without copying this repo's Git
+history:
 
 ```sh
 rsync -av \
@@ -48,13 +47,25 @@ rsync -av \
   ./ ../contributions/
 ```
 
-Then work from the output repo:
+From this point on, run setup commands from the output repo:
 
 ```sh
 cd ../contributions
 ```
 
-## Step 1: Build Your Timeline Config
+Check that the output repo still has no commits before importing history:
+
+```sh
+git status --short --branch
+git rev-parse --verify HEAD >/dev/null 2>&1 \
+  && echo "repo has commits: stop" \
+  || echo "empty repo: OK"
+```
+
+The `empty repo: OK` line is expected. If it prints `repo has commits: stop`,
+stop and use a truly empty output repo.
+
+### Step 2: Build Your Timeline Config
 
 Edit:
 
@@ -65,6 +76,13 @@ travel_history.json
 
 The included files are examples. Replace them with your own data before
 generation.
+
+Validate the JSON after editing:
+
+```sh
+python3 -m json.tool work_history.json >/dev/null
+python3 -m json.tool travel_history.json >/dev/null
+```
 
 ### `work_history.json` Schema
 
@@ -126,13 +144,13 @@ Use `type: "education"` for school and `type: "experience"` for work. Omit
 Use IANA timezone names such as `America/Los_Angeles`, `Europe/London`,
 `Europe/Paris`, `America/New_York`, or `Pacific/Tahiti`.
 
-## LLM Prompts
+### LLM Prompts
 
 These prompts are designed for ChatGPT, Claude, or another LLM. Paste your own
 resume, LinkedIn export, flight history, calendar notes, or email snippets after
 the prompt.
 
-### Prompt: Generate Work History JSON
+#### Prompt: Generate Work History JSON
 
 ```text
 You are helping me produce a clean `work_history.json` file for a deterministic
@@ -174,7 +192,7 @@ Here is my source material:
 [PASTE RESUME / LINKEDIN / WORK HISTORY HERE]
 ```
 
-### Prompt: Generate Travel History JSON
+#### Prompt: Generate Travel History JSON
 
 ```text
 You are helping me produce a clean `travel_history.json` file for a deterministic
@@ -233,7 +251,7 @@ Here is my travel source material:
 [PASTE FLIGHTS / EMAIL NOTES / CALENDAR / TRAVEL HISTORY HERE]
 ```
 
-### Prompt: Audit The JSON Before Running
+#### Prompt: Audit The JSON Before Running
 
 ```text
 Review these `work_history.json` and `travel_history.json` files for a
@@ -259,12 +277,14 @@ Here are the files:
 [PASTE BOTH JSON FILES HERE]
 ```
 
-## Step 2: Fetch Real Contribution Baseline
+### Step 3: Generate And Push Initial History
 
-This step is optional but recommended for any years where GitHub already has
-real activity.
+If GitHub already shows real activity for your account, fetch a baseline first.
+The generator uses this file to skip or reduce generated commits on dates that
+already have real contributions.
 
-Create a GitHub personal access token and export it locally:
+Create a GitHub personal access token that can read your contribution calendar,
+then export it locally:
 
 ```sh
 export GH_CONTRIBUTIONS_TOKEN=ghp_your_token_here
@@ -278,7 +298,8 @@ python3 scripts/fetch_existing_contributions.py --login YOUR_LOGIN
 
 This writes `existing_contributions.json`.
 
-## Step 3: Generate And Push The Output Repo
+If you do not want to fetch a baseline, leave the included
+`existing_contributions.json` in place. It contains an empty `active_days` map.
 
 Preview the plan:
 
@@ -301,7 +322,7 @@ git push -u origin main
 If GitHub does not update the profile graph immediately, wait. Contribution
 indexing is not instant.
 
-## Daily Safety Net
+### Step 4: Enable The Daily Safety Net
 
 The optional workflow keeps the graph warm after the generated range. It is
 manual-only in this template so GitHub Actions does not run automatically.
@@ -315,7 +336,7 @@ timezone if needed. The Python script records safety-net commits at `6:05 PM` in
 weekend/Monday days. If GitHub already shows activity for the day, it does
 nothing.
 
-Set these repository variables in the generated output repo:
+Set these repository variables from your local output repo:
 
 ```sh
 gh variable set CONTRIBUTION_AUTHOR_NAME --body "Your Name"
@@ -325,18 +346,23 @@ gh variable set CONTRIBUTION_LOCATION --body "Your City"
 gh variable set CONTRIBUTION_TIMEZONE --body "America/Los_Angeles"
 ```
 
-Set this repository secret if you want private contribution awareness:
+Set this repository secret if you want the workflow to detect private
+contribution activity before creating a safety-net commit:
 
 ```sh
 gh secret set GH_CONTRIBUTIONS_TOKEN
 ```
 
-Then test:
+Run it manually once:
 
 ```sh
 gh workflow run "Daily contribution safety net"
 gh run list --workflow "Daily contribution safety net" --limit 5
 ```
+
+If the manual run creates no commit, check the run logs. Common valid reasons
+are: today already has activity, today is a monthly rest day, today is inside a
+holiday slowdown, or today is a quiet weekend/Monday safety-net day.
 
 ## How The History Is Written
 
