@@ -72,16 +72,19 @@ Edit:
 ```text
 work_history.json
 travel_history.json
+contribution_rules.json
 ```
 
-The included files are examples. Replace them with your own data before
-generation.
+The included history files are examples. Replace them with your own data before
+generation. The included rules file is usable as-is, but you should tune it if
+your timeline needs different eras, yearly targets, or activity density.
 
 Validate the JSON after editing:
 
 ```sh
 python3 -m json.tool work_history.json >/dev/null
 python3 -m json.tool travel_history.json >/dev/null
+python3 -m json.tool contribution_rules.json >/dev/null
 ```
 
 ### `work_history.json` Schema
@@ -143,6 +146,28 @@ Use `type: "education"` for school and `type: "experience"` for work. Omit
 
 Use IANA timezone names such as `America/Los_Angeles`, `Europe/London`,
 `Europe/Paris`, `America/New_York`, or `Pacific/Tahiti`.
+
+### `contribution_rules.json`
+
+This file controls how active the generated history looks. Most users should
+start by editing these sections:
+
+- `date_range`: default start and end dates for generation.
+- `eras`: date ranges, note categories, and density profile for each life/work
+  era.
+- `annual_total_targets`: exact yearly totals for years that should land in a
+  specific range after existing GitHub activity is considered.
+- `annual_bursts`: deterministic 10-12 commit spike days for busy years.
+- `monthly_rest_days`: random-looking rest days in the assisted-coding era.
+- `commit_times`: local author times used for multi-commit days.
+
+The generator supports these density types:
+
+- `college_coursework`: term-time, summer, and holiday-gap behavior.
+- `weekend_only`: sparse weekend maintenance.
+- `weekday_project`: mostly weekday project work with occasional weekends.
+- `year_taper`: per-year probabilities for management or reduced activity.
+- `assisted_gradient`: month-by-month ramp with quieter weekends/Mondays.
 
 ### LLM Prompts
 
@@ -254,8 +279,9 @@ Here is my travel source material:
 #### Prompt: Audit The JSON Before Running
 
 ```text
-Review these `work_history.json` and `travel_history.json` files for a
-deterministic Git contribution-history generator.
+Review these `work_history.json`, `travel_history.json`, and
+`contribution_rules.json` files for a deterministic Git contribution-history
+generator.
 
 Check for:
 - invalid JSON
@@ -266,6 +292,8 @@ Check for:
 - missing IANA timezones
 - future facts appearing too early
 - date gaps that should be intentional travel/no-generation gaps
+- contribution eras that overlap or leave unexpected gaps
+- annual targets that conflict with vacation/travel/no-generation ranges
 
 Return:
 1. A short list of issues.
@@ -274,7 +302,45 @@ Return:
 
 Here are the files:
 
-[PASTE BOTH JSON FILES HERE]
+[PASTE work_history.json, travel_history.json, and contribution_rules.json HERE]
+```
+
+#### Prompt: Tune Contribution Rules JSON
+
+```text
+You are helping me tune `contribution_rules.json` for a deterministic Git
+contribution-history generator.
+
+Use my work and travel timeline to create believable contribution-density eras.
+Do not change factual work or travel dates. Only adjust generation rules.
+
+Output valid JSON only, preserving this top-level shape:
+- source
+- date_range
+- existing_activity
+- commit_times
+- holiday_slowdown
+- vacation_slowdown
+- eras
+- annual_total_targets
+- annual_quota
+- annual_bursts
+- monthly_rest_days
+
+Rules:
+- Use non-overlapping era date ranges.
+- Keep activity credible for each life stage.
+- Prefer weekday-heavy activity for full-time project/work eras.
+- Use lower activity during vacations, holidays, and management-heavy eras.
+- Add annual targets only for years that need calibrated totals.
+- Keep burst days enabled only for years with enough total activity to justify
+  visible spikes.
+- Keep commit times in local daytime/evening hours.
+- Do not invent new jobs, schools, trips, or locations.
+
+Here are my current files:
+
+[PASTE work_history.json, travel_history.json, and contribution_rules.json HERE]
 ```
 
 ### Step 3: Generate And Push Initial History
@@ -305,6 +371,13 @@ Preview the plan:
 
 ```sh
 python3 generate_history.py --dry-run
+```
+
+To compare a rules variant without replacing the default file, pass it
+explicitly:
+
+```sh
+python3 generate_history.py --rules contribution_rules.variant.json --dry-run
 ```
 
 Import into the current empty repository:
@@ -377,6 +450,9 @@ Each commit uses local timestamps based on `travel_history.json`.
 Busy years also get a few deterministic 10-12 commit burst days. Those spikes
 are created by redistributing commits from nearby normal days, so yearly totals
 stay stable instead of being inflated.
+
+Density rules, annual targets, bursts, note categories, assisted-era rest days,
+and commit times are configured in `contribution_rules.json`.
 
 The generator also emits retrospective `work_history.json` and
 `travel_history.json` snapshots. Job and travel-history notes appear a few days

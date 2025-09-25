@@ -18,8 +18,6 @@ from zoneinfo import ZoneInfo
 
 START = date(2010, 1, 3)
 END = date.today()
-REAL_HISTORY_START = date(2014, 5, 1)
-ASSISTED_ERA_START = date(2025, 6, 1)
 DEFAULT_AUTHOR_NAME = "Example Developer"
 DEFAULT_AUTHOR_EMAIL = "developer@example.com"
 REF = "refs/heads/main"
@@ -33,6 +31,7 @@ METADATA_FILES = [
 FINAL_TOOLING_FILES = [
     ".github/workflows/daily-contribution.yml",
     "README.md",
+    "contribution_rules.json",
     "existing_contributions.json",
     "generate_history.py",
     "scripts/daily_contribution.py",
@@ -40,26 +39,6 @@ FINAL_TOOLING_FILES = [
 ]
 FINAL_CURRENT_FILES = [*METADATA_FILES, *FINAL_TOOLING_FILES]
 SEED_FILES = [*INITIAL_SEED_FILES, *FINAL_CURRENT_FILES]
-COMMIT_TIMES = [
-    time(12, 0),
-    time(13, 13),
-    time(14, 37),
-    time(16, 4),
-    time(17, 42),
-    time(19, 3),
-    time(20, 26),
-    time(21, 49),
-    time(22, 12),
-    time(22, 47),
-    time(23, 11),
-    time(23, 34),
-]
-ANNUAL_TOTAL_TARGETS = {
-    2021: 240,
-    2022: 240,
-    2023: 240,
-    2024: 260,
-}
 
 
 @dataclass(frozen=True)
@@ -77,10 +56,11 @@ class PlannedCommit:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start", default=START.isoformat())
-    parser.add_argument("--end", default=END.isoformat())
+    parser.add_argument("--start")
+    parser.add_argument("--end")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--import-history", action="store_true")
+    parser.add_argument("--rules", default="contribution_rules.json")
     parser.add_argument("--existing-contributions", default="existing_contributions.json")
     parser.add_argument("--work-history", default="work_history.json")
     parser.add_argument("--travel-history", default="travel_history.json")
@@ -108,6 +88,17 @@ def git_value(args: list[str], fallback: str) -> str:
 
 def parse_day(value: str) -> date:
     return date.fromisoformat(value)
+
+
+def parse_config_day(value: str) -> date:
+    if value == "today":
+        return date.today()
+    return parse_day(value)
+
+
+def parse_config_time(value: str) -> time:
+    hour, minute = value.split(":", 1)
+    return time(int(hour), int(minute))
 
 
 def each_day(start: date, end: date):
@@ -160,33 +151,85 @@ def holiday_slowdown_reason(day: date) -> str | None:
     return None
 
 
-def apply_holiday_slowdown(day: date, count: int) -> int:
+def apply_holiday_slowdown(day: date, count: int, rules: dict) -> int:
     reason = holiday_slowdown_reason(day)
     if not reason or count == 0:
         return count
-    probability = 0.18 if "Thanksgiving" in reason else 0.10
+    holiday_rules = rules.get("holiday_slowdown", {})
+    probability = (
+        holiday_rules.get("thanksgiving_active_probability", 0.18)
+        if "Thanksgiving" in reason
+        else holiday_rules.get("christmas_new_year_active_probability", 0.10)
+    )
     if stable_float(day, f"{reason}:active") >= probability:
         return 0
     return 1
 
 
-def era_for(day: date) -> str:
-    if day <= date(2014, 4, 30):
-        return "college"
-    if day <= date(2015, 12, 31):
-        return "post_college_weekend"
-    if day <= date(2019, 3, 31):
-        return "intense_project"
-    if day <= date(2024, 6, 30):
-        return "management_taper"
-    if day <= date(2025, 5, 31):
-        return "quiet_gap"
-    return "assisted_coding"
+def era_for(day: date, rules: dict) -> str:
+    for item in rules["_eras"]:
+        end = item["_end"] or date.max
+        if item["_start"] <= day <= end:
+            return item["name"]
+    raise SystemExit(f"no contribution era configured for {day.isoformat()}")
 
 
 def load_json(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def load_contribution_rules(path: Path) -> dict:
+    rules = load_json(path)
+    date_range = rules.get("date_range", {})
+    rules["_start"] = parse_config_day(date_range.get("start", START.isoformat()))
+    rules["_end"] = parse_config_day(date_range.get("end", END.isoformat()))
+    if rules["_end"] < rules["_start"]:
+        raise SystemExit("contribution_rules.json date_range.end must be on or after date_range.start")
+
+    existing_activity = rules.get("existing_activity", {})
+    rules["_existing_skip_after"] = parse_config_day(
+        existing_activity.get("skip_generated_after", rules["_start"].isoformat())
+    )
+    rules["_reduce_generated_in_eras"] = set(existing_activity.get("reduce_generated_in_eras", []))
+    rules["_commit_times"] = [parse_config_time(value) for value in rules["commit_times"]]
+    if not rules["_commit_times"]:
+        raise SystemExit("contribution_rules.json commit_times must not be empty")
+
+    eras = []
+    for entry in rules["eras"]:
+        item = dict(entry)
+        item["_start"] = parse_day(item["start"])
+        item["_end"] = parse_day(item["end"]) if item.get("end") else None
+        item.setdefault("note_categories", [item["name"]])
+        eras.append(item)
+    eras.sort(key=lambda item: item["_start"])
+    previous = None
+    for item in eras:
+        if previous is not None:
+            previous_end = previous["_end"] or date.max
+            if item["_start"] <= previous_end:
+                raise SystemExit(
+                    "contribution_rules.json eras overlap: "
+                    f"{previous['name']} and {item['name']}"
+                )
+        previous = item
+    rules["_eras"] = eras
+    rules["_eras_by_name"] = {item["name"]: item for item in eras}
+    rules["_annual_total_targets"] = {
+        int(year): int(total) for year, total in rules.get("annual_total_targets", {}).items()
+    }
+    if "annual_bursts" in rules:
+        rules["annual_bursts"]["thresholds"] = sorted(
+            rules["annual_bursts"].get("thresholds", []),
+            key=lambda item: int(item["minimum_graph_total"]),
+            reverse=True,
+        )
+    rules["_burst_weekday_penalties"] = {
+        int(weekday): int(penalty)
+        for weekday, penalty in rules.get("annual_bursts", {}).get("weekday_penalties", {}).items()
+    }
+    return rules
 
 
 def load_existing_contributions(path: Path) -> dict[str, int]:
@@ -274,10 +317,16 @@ def vacation_slowdown_reason(travel: dict, day: date) -> str | None:
     return None
 
 
-def apply_vacation_slowdown(day: date, count: int, label: str | None) -> int:
+def apply_vacation_slowdown(day: date, count: int, label: str | None, rules: dict) -> int:
     if not label or count == 0:
         return count
-    probability = 0.10 if any(word in label.lower() for word in ("honeymoon", "vacation")) else 0.14
+    vacation_rules = rules.get("vacation_slowdown", {})
+    keywords = vacation_rules.get("deep_vacation_keywords", ["honeymoon", "vacation"])
+    probability = (
+        vacation_rules.get("deep_vacation_active_probability", 0.10)
+        if any(word in label.lower() for word in keywords)
+        else vacation_rules.get("default_active_probability", 0.14)
+    )
     if stable_float(day, f"{label}:vacation-active") >= probability:
         return 0
     return 1
@@ -292,128 +341,127 @@ def location_for(travel: dict, day: date) -> tuple[str, str]:
     return default["name"], default["timezone"]
 
 
-def note_category(day: date, era: str, sequence: int) -> str:
-    categories = {
-        "college": ["coursework", "lab", "project", "debugging"],
-        "post_college_weekend": ["portfolio", "mobile-notes", "maintenance"],
-        "intense_project": ["feature-work", "integration", "prototype", "release-notes"],
-        "management_taper": ["maintenance", "tooling", "reading-notes"],
-        "quiet_gap": ["maintenance", "archive"],
-        "assisted_coding": ["agent-workflow", "automation", "prompt-systems", "tooling", "code-assist"],
-    }[era]
+def note_category(day: date, era: str, sequence: int, rules: dict) -> str:
+    categories = rules["_eras_by_name"][era]["note_categories"]
     return categories[stable_int(f"{day.isoformat()}:{sequence}", "category", len(categories))]
 
 
-def raw_generated_count(day: date, era: str) -> int:
-    if day == START:
+def configured_range_count(day: date, count_range: list[int], salt: str) -> int:
+    return choose_count(day, salt, int(count_range[0]), int(count_range[1]))
+
+
+def configured_activity_count(day: date, config: dict, weekend: bool, rules: dict) -> int:
+    if "active_probability" in config:
+        probability = float(config["active_probability"])
+    else:
+        probability = float(config["weekend_probability"] if weekend else config["weekday_probability"])
+    if probability <= 0 or stable_float(day, config["active_salt"]) >= probability:
+        return 0
+
+    if "count" in config:
+        count_range = config["count"]
+    else:
+        count_range = config["weekend_count"] if weekend else config["weekday_count"]
+    count = configured_range_count(day, count_range, config["count_salt"])
+    return apply_holiday_slowdown(day, count, rules)
+
+
+def raw_generated_count(day: date, era: str, rules: dict) -> int:
+    if day == rules["_start"]:
         return 1
 
+    era_config = rules["_eras_by_name"][era]
+    density = era_config["density"]
+    density_type = density["type"]
     weekend = is_weekend(day)
-    count = 0
-    if era == "college":
+
+    if density_type == "college_coursework":
         if is_holiday_gap(day):
-            probability = 0.12 if not weekend else 0.05
-            return 1 if stable_float(day, "college-holiday") < probability else 0
-        if day.month in {6, 7, 8}:
-            probability = 0.50 if not weekend else 0.22
-            if stable_float(day, "college-summer") >= probability:
-                return 0
-            count = choose_count(day, "college-summer-count", 1, 3)
-            return apply_holiday_slowdown(day, count)
-        probability = 0.84 if not weekend else 0.34
-        if stable_float(day, "college-term") >= probability:
-            return 0
-        count = choose_count(day, "college-term-count", 1, 4 if not weekend else 3)
-        return apply_holiday_slowdown(day, count)
+            holiday_gap = density["holiday_gap"]
+            probability = (
+                holiday_gap["weekend_probability"] if weekend else holiday_gap["weekday_probability"]
+            )
+            return 1 if stable_float(day, holiday_gap["active_salt"]) < probability else 0
+        if day.month in set(density["summer_months"]):
+            return configured_activity_count(day, density["summer"], weekend, rules)
+        return configured_activity_count(day, density["term"], weekend, rules)
 
-    if era == "post_college_weekend":
-        if not weekend or stable_float(day, "post-college-weekend") >= 0.23:
+    if density_type == "weekend_only":
+        if not weekend:
             return 0
-        count = choose_count(day, "post-college-count", 1, 3)
-        return apply_holiday_slowdown(day, count)
+        return configured_activity_count(day, density, weekend, rules)
 
-    if era == "intense_project":
-        if weekend:
-            if stable_float(day, "intense-weekend-occasional") >= 0.18:
-                return 0
-            count = choose_count(day, "intense-weekend-occasional-count", 1, 3)
-            return apply_holiday_slowdown(day, count)
-        if stable_float(day, "intense-weekday-primary") >= 0.70:
+    if density_type == "weekday_project":
+        return configured_activity_count(day, density["weekend" if weekend else "weekday"], weekend, rules)
+
+    if density_type == "year_taper":
+        year_config = density["years"].get(str(day.year))
+        if not year_config:
             return 0
-        count = choose_count(day, "intense-weekday-primary-count", 2, 4)
-        return apply_holiday_slowdown(day, count)
-
-    if era == "management_taper":
-        probabilities = {
-            2019: (0.07, 0.24, 1, 3),
-            2020: (0.18, 0.13, 1, 2),
-            2021: (0.18, 0.02, 1, 2),
-            2022: (0.12, 0.01, 1, 1),
-            2023: (0.07, 0.00, 1, 1),
-            2024: (0.05, 0.00, 1, 1),
-        }
-        weekend_probability, weekday_probability, low, high = probabilities[day.year]
-        probability = weekend_probability if weekend else weekday_probability
-        if probability <= 0 or stable_float(day, "management-taper") >= probability:
+        probability = (
+            year_config["weekend_probability"] if weekend else year_config["weekday_probability"]
+        )
+        if probability <= 0 or stable_float(day, density["active_salt"]) >= probability:
             return 0
-        count = choose_count(day, "management-count", low, high)
-        return apply_holiday_slowdown(day, count)
+        count = configured_range_count(day, year_config["count"], density["count_salt"])
+        return apply_holiday_slowdown(day, count, rules)
 
-    if era == "quiet_gap":
-        if not weekend or stable_float(day, "quiet-gap") >= 0.05:
-            return 0
-        return apply_holiday_slowdown(day, 1)
-
-    if era == "assisted_coding":
-        month_index = (day.year - ASSISTED_ERA_START.year) * 12 + (day.month - ASSISTED_ERA_START.month)
-        ramp = max(0, min(month_index, 5))
-        quiet_day = day.weekday() in {0, 5, 6}
-        weekday_probabilities = [0.55, 0.65, 0.72, 0.80, 0.86, 0.90]
-        quiet_probabilities = [0.18, 0.24, 0.30, 0.34, 0.38, 0.40]
-        count_ranges = [(2, 5), (3, 6), (3, 7), (4, 8), (5, 9), (5, 9)]
+    if density_type == "assisted_gradient":
+        era_start = era_config["_start"]
+        month_index = (day.year - era_start.year) * 12 + (day.month - era_start.month)
+        count_ranges = density["count_ranges"]
+        ramp = max(0, min(month_index, len(count_ranges) - 1))
+        quiet_day = day.weekday() in set(density["quiet_weekdays"])
+        weekday_probabilities = density["weekday_probabilities"]
+        quiet_probabilities = density["quiet_probabilities"]
         probability = quiet_probabilities[ramp] if quiet_day else weekday_probabilities[ramp]
-        if stable_float(day, "assisted-gradient-active") >= probability:
+        if stable_float(day, density["active_salt"]) >= probability:
             return 0
         low, high = count_ranges[ramp]
         if quiet_day:
-            low = max(2, low - 1)
-            high = max(low, high - 2)
-        count = choose_count(day, "assisted-gradient-count", low, high)
-        return apply_holiday_slowdown(day, count)
+            adjustment = density["quiet_count_adjustment"]
+            low = max(int(adjustment["minimum_low"]), low + int(adjustment["low_delta"]))
+            high = max(low, high + int(adjustment["high_delta"]))
+        count = choose_count(day, density["count_salt"], low, high)
+        return apply_holiday_slowdown(day, count, rules)
 
-    raise ValueError(f"unknown era: {era}")
+    raise ValueError(f"unknown density type for {era}: {density_type}")
 
 
-def generated_count(day: date, existing_count: int) -> int:
-    era = era_for(day)
-    target = raw_generated_count(day, era)
+def generated_count(day: date, existing_count: int, rules: dict) -> int:
+    era = era_for(day, rules)
+    target = raw_generated_count(day, era, rules)
     if target == 0:
         return 0
 
-    if day >= REAL_HISTORY_START and era != "assisted_coding" and existing_count > 0:
+    reduce_eras = rules["_reduce_generated_in_eras"]
+    if day >= rules["_existing_skip_after"] and era not in reduce_eras and existing_count > 0:
         return 0
 
-    if era == "assisted_coding" and existing_count > 0:
+    if era in reduce_eras and existing_count > 0:
         return max(0, target - existing_count)
 
     return target
 
 
-def quota_day_count(day: date) -> int:
-    if day.year == 2022:
-        burst = stable_float(day, "annual-quota-2022-burst")
-        if burst < 0.12:
-            return 4
-        if burst < 0.34:
-            return 3
-        if burst < 0.68:
-            return 2
-        return 1
+def quota_day_count(day: date, rules: dict) -> int:
+    annual_quota = rules.get("annual_quota", {})
+    override = annual_quota.get("year_overrides", {}).get(str(day.year))
+    if override:
+        value = stable_float(day, override["salt"])
+        for band in override["bands"]:
+            if "below" not in band or value < float(band["below"]):
+                return int(band["count"])
 
-    count = 1
-    if stable_float(day, "annual-quota-second") < 0.52:
+    default = annual_quota.get("default", {})
+    count = int(default.get("base_count", 1))
+    if stable_float(day, default.get("second_salt", "annual-quota-second")) < float(
+        default.get("second_probability", 0.52)
+    ):
         count += 1
-    if stable_float(day, "annual-quota-third") < 0.16:
+    if stable_float(day, default.get("third_salt", "annual-quota-third")) < float(
+        default.get("third_probability", 0.16)
+    ):
         count += 1
     return count
 
@@ -423,21 +471,26 @@ def annual_quota_counts(
     end: date,
     existing: dict[str, int],
     travel: dict,
+    rules: dict,
 ) -> dict[date, int]:
     counts: dict[date, int] = {}
+    annual_targets = rules["_annual_total_targets"]
     existing_by_year: Counter = Counter()
     for day_value, count in existing.items():
         day = parse_day(day_value)
-        if start <= day <= end and day.year in ANNUAL_TOTAL_TARGETS:
+        if start <= day <= end and day.year in annual_targets:
             existing_by_year[day.year] += int(count)
 
-    for year, total_target in ANNUAL_TOTAL_TARGETS.items():
+    for year, total_target in annual_targets.items():
+        year_start = max(start, date(year, 1, 1))
+        year_end = min(end, date(year, 12, 31))
+        if year_end < year_start:
+            continue
+
         generated_target = max(0, total_target - existing_by_year[year])
         if generated_target == 0:
             continue
 
-        year_start = max(start, date(year, 1, 1))
-        year_end = min(end, date(year, 12, 31))
         candidates = [
             day
             for day in each_day(year_start, year_end)
@@ -452,7 +505,7 @@ def annual_quota_counts(
         for day in candidates:
             if remaining <= 0:
                 break
-            count = min(quota_day_count(day), remaining)
+            count = min(quota_day_count(day, rules), remaining)
             counts[day] = count
             remaining -= count
 
@@ -462,36 +515,33 @@ def annual_quota_counts(
     return counts
 
 
-def annual_burst_count(year: int, generated_total: int, existing_total: int) -> int:
-    if generated_total < 200:
+def annual_burst_count(year: int, generated_total: int, existing_total: int, rules: dict) -> int:
+    burst_rules = rules.get("annual_bursts", {})
+    if not burst_rules.get("enabled", True):
+        return 0
+    if generated_total < int(burst_rules.get("minimum_generated_total", 200)):
         return 0
     graph_total = generated_total + existing_total
-    if graph_total < 220:
+    if graph_total < int(burst_rules.get("minimum_graph_total", 220)):
         return 0
-    if graph_total >= 500:
-        return 5
-    if graph_total >= 350:
-        return 4
-    return 3
+    for threshold in burst_rules.get("thresholds", []):
+        if graph_total >= int(threshold["minimum_graph_total"]):
+            return int(threshold["burst_days"])
+    return 0
 
 
-def burst_candidate_sort_key(day: date) -> tuple[int, int]:
-    weekday_penalty = {
-        1: 0,
-        2: 0,
-        3: 0,
-        4: 0,
-        6: 220_000,
-        0: 420_000,
-        5: 620_000,
-    }[day.weekday()]
-    return weekday_penalty, stable_int(day.isoformat(), "annual-burst-candidate", 1_000_000)
+def burst_candidate_sort_key(day: date, rules: dict) -> tuple[int, int]:
+    burst_rules = rules.get("annual_bursts", {})
+    weekday_penalty = rules["_burst_weekday_penalties"].get(day.weekday(), 0)
+    candidate_salt = burst_rules.get("candidate_salt", "annual-burst-candidate")
+    return weekday_penalty, stable_int(day.isoformat(), candidate_salt, 1_000_000)
 
 
-def select_burst_days(candidates: list[date], target: int) -> list[date]:
+def select_burst_days(candidates: list[date], target: int, rules: dict) -> list[date]:
+    burst_rules = rules.get("annual_bursts", {})
     selected: list[date] = []
-    candidates = sorted(candidates, key=burst_candidate_sort_key)
-    for minimum_gap in (28, 21, 14, 7, 0):
+    candidates = sorted(candidates, key=lambda day: burst_candidate_sort_key(day, rules))
+    for minimum_gap in burst_rules.get("minimum_gap_days", [28, 21, 14, 7, 0]):
         for day in candidates:
             if day in selected:
                 continue
@@ -503,27 +553,39 @@ def select_burst_days(candidates: list[date], target: int) -> list[date]:
     return sorted(selected)
 
 
-def redistribute_for_burst(counts: dict[date, int], burst_day: date, target_count: int) -> bool:
+def redistribute_for_burst(
+    counts: dict[date, int],
+    burst_day: date,
+    target_count: int,
+    start: date,
+    end: date,
+    rules: dict,
+) -> bool:
     needed = target_count - counts[burst_day]
     if needed <= 0:
         return True
 
     year = burst_day.year
-    burst_era = era_for(burst_day)
+    burst_rules = rules.get("annual_bursts", {})
+    burst_era = era_for(burst_day, rules)
     donors = [
         day
         for day, count in counts.items()
         if day.year == year
-        and era_for(day) == burst_era
-        and day != START
-        and day != END
+        and era_for(day, rules) == burst_era
+        and day != start
+        and day != end
         and day != burst_day
         and count > 1
     ]
     donors.sort(
         key=lambda day: (
             abs((day - burst_day).days),
-            stable_int(day.isoformat(), f"annual-burst-donor:{burst_day.isoformat()}", 1_000_000),
+            stable_int(
+                day.isoformat(),
+                f"{burst_rules.get('donor_salt_prefix', 'annual-burst-donor')}:{burst_day.isoformat()}",
+                1_000_000,
+            ),
         )
     )
 
@@ -543,16 +605,20 @@ def redistribute_for_burst(counts: dict[date, int], burst_day: date, target_coun
         day
         for day, count in counts.items()
         if day.year == year
-        and era_for(day) == burst_era
-        and day != START
-        and day != END
+        and era_for(day, rules) == burst_era
+        and day != start
+        and day != end
         and day != burst_day
         and count > 0
     ]
     fallback_donors.sort(
         key=lambda day: (
             abs((day - burst_day).days),
-            stable_int(day.isoformat(), f"annual-burst-fallback:{burst_day.isoformat()}", 1_000_000),
+            stable_int(
+                day.isoformat(),
+                f"{burst_rules.get('fallback_salt_prefix', 'annual-burst-fallback')}:{burst_day.isoformat()}",
+                1_000_000,
+            ),
         )
     )
     for donor in fallback_donors:
@@ -571,6 +637,7 @@ def apply_annual_bursts(
     travel: dict,
     start: date,
     end: date,
+    rules: dict,
 ) -> dict[date, int]:
     adjusted = dict(counts)
     years = sorted({day.year for day in adjusted} | {parse_day(day).year for day in existing})
@@ -578,10 +645,12 @@ def apply_annual_bursts(
     for year in years:
         generated_total = sum(count for day, count in adjusted.items() if day.year == year)
         existing_total = sum(count for day, count in existing.items() if parse_day(day).year == year)
-        burst_target = annual_burst_count(year, generated_total, existing_total)
+        burst_target = annual_burst_count(year, generated_total, existing_total, rules)
         if burst_target == 0:
             continue
 
+        burst_rules = rules.get("annual_bursts", {})
+        target_config = burst_rules.get("target_count", {})
         year_start = max(start, date(year, 1, 1))
         year_end = min(end, date(year, 12, 31))
         candidates = [
@@ -589,18 +658,23 @@ def apply_annual_bursts(
             for day in each_day(year_start, year_end)
             if adjusted.get(day, 0) >= 2
             and adjusted.get(day, 0) < 10
-            and day != START
-            and day != END
+            and day != start
+            and day != end
             and existing.get(day.isoformat(), 0) == 0
             and travel_skip_reason(travel, day) is None
             and vacation_slowdown_reason(travel, day) is None
             and holiday_slowdown_reason(day) is None
         ]
-        selected = select_burst_days(candidates, burst_target)
+        selected = select_burst_days(candidates, burst_target, rules)
 
         for burst_day in selected:
-            target_count = choose_count(burst_day, "annual-burst-target", 10, 12)
-            redistribute_for_burst(adjusted, burst_day, target_count)
+            target_count = choose_count(
+                burst_day,
+                target_config.get("salt", "annual-burst-target"),
+                int(target_config.get("min", 10)),
+                int(target_config.get("max", 12)),
+            )
+            redistribute_for_burst(adjusted, burst_day, target_count, start, end, rules)
 
     return {day: count for day, count in adjusted.items() if count > 0}
 
@@ -610,17 +684,29 @@ def claude_monthly_vacation_days(
     end: date,
     existing: dict[str, int],
     travel: dict,
+    rules: dict,
 ) -> dict[date, str]:
     vacation_days: dict[date, str] = {}
-    month = date(max(start, ASSISTED_ERA_START).year, max(start, ASSISTED_ERA_START).month, 1)
+    rest_rules = rules.get("monthly_rest_days", {})
+    if not rest_rules.get("enabled", True):
+        return vacation_days
+    rest_era = rest_rules.get("era")
+    if rest_era not in rules["_eras_by_name"]:
+        return vacation_days
+
+    rest_start = rules["_eras_by_name"][rest_era]["_start"]
+    first_day = max(start, rest_start)
+    month = date(first_day.year, first_day.month, 1)
     final_month = date(end.year, end.month, 1)
 
     while month <= final_month:
         month_end = date(month.year + (month.month // 12), (month.month % 12) + 1, 1) - timedelta(days=1)
-        window_start = max(start, ASSISTED_ERA_START, month)
+        window_start = max(start, rest_start, month)
         window_end = min(end, month_end)
         month_key = f"{month.year:04d}-{month.month:02d}"
-        target = 3 + stable_int(month_key, "claude-monthly-vacation-count", 2)
+        minimum = int(rest_rules.get("min_days_per_month", 3))
+        maximum = int(rest_rules.get("max_days_per_month", minimum))
+        target = minimum + stable_int(month_key, rest_rules.get("count_salt", "monthly-rest-count"), maximum - minimum + 1)
         candidates = []
 
         for day in each_day(window_start, window_end):
@@ -632,13 +718,17 @@ def claude_monthly_vacation_days(
                 continue
             if existing.get(day.isoformat(), 0) > 0:
                 continue
-            if raw_generated_count(day, "assisted_coding") == 0:
+            if raw_generated_count(day, rest_era, rules) == 0:
                 continue
             candidates.append(day)
 
-        candidates.sort(key=lambda item: stable_int(item.isoformat(), "claude-monthly-vacation-day", 1_000_000))
+        candidates.sort(
+            key=lambda item: stable_int(
+                item.isoformat(), rest_rules.get("day_salt", "monthly-rest-day"), 1_000_000
+            )
+        )
         for day in candidates[:target]:
-            vacation_days[day] = f"monthly vacation day {month_key}"
+            vacation_days[day] = f"{rest_rules.get('label_prefix', 'monthly vacation day')} {month_key}"
 
         if month.month == 12:
             month = date(month.year + 1, 1, 1)
@@ -654,16 +744,19 @@ def plan_commits(
     existing: dict[str, int],
     work_history: list[dict],
     travel: dict,
+    rules: dict,
 ) -> tuple[list[PlannedCommit], Counter, Counter]:
     planned: list[PlannedCommit] = []
     planned_counts: dict[date, int] = {}
     skip_reasons: Counter = Counter()
     real_active_skips: Counter = Counter()
-    annual_counts = annual_quota_counts(start, end, existing, travel)
-    monthly_vacation_days = claude_monthly_vacation_days(start, end, existing, travel)
+    annual_targets = rules["_annual_total_targets"]
+    reduce_eras = rules["_reduce_generated_in_eras"]
+    annual_counts = annual_quota_counts(start, end, existing, travel, rules)
+    monthly_vacation_days = claude_monthly_vacation_days(start, end, existing, travel, rules)
 
     for day in each_day(start, end):
-        era = era_for(day)
+        era = era_for(day, rules)
         skip_reason = travel_skip_reason(travel, day)
         if skip_reason:
             skip_reasons[skip_reason] += 1
@@ -674,31 +767,31 @@ def plan_commits(
 
         existing_count = existing.get(day.isoformat(), 0)
         vacation_reason = vacation_slowdown_reason(travel, day)
-        if day.year in ANNUAL_TOTAL_TARGETS:
+        if day.year in annual_targets:
             raw_count = annual_counts.get(day, 0)
             count = raw_count
         else:
-            raw_count = raw_generated_count(day, era)
-            count = generated_count(day, existing_count)
-        slowed_count = apply_vacation_slowdown(day, count, vacation_reason)
+            raw_count = raw_generated_count(day, era, rules)
+            count = generated_count(day, existing_count, rules)
+        slowed_count = apply_vacation_slowdown(day, count, vacation_reason, rules)
         if vacation_reason and count > 0 and slowed_count == 0:
             skip_reasons[f"{vacation_reason} vacation slowdown"] += 1
         count = slowed_count
-        if day == end and era == "assisted_coding" and count == 0 and not vacation_reason:
+        if day == end and era in reduce_eras and count == 0 and not vacation_reason:
             count = 1
-        if day >= REAL_HISTORY_START and era != "assisted_coding" and existing_count > 0 and raw_count > 0:
+        if day >= rules["_existing_skip_after"] and era not in reduce_eras and existing_count > 0 and raw_count > 0:
             real_active_skips[era] += 1
         if count == 0:
             continue
         planned_counts[day] = count
 
-    planned_counts = apply_annual_bursts(planned_counts, existing, travel, start, end)
+    planned_counts = apply_annual_bursts(planned_counts, existing, travel, start, end, rules)
 
     for day in each_day(start, end):
         count = planned_counts.get(day, 0)
         if count == 0:
             continue
-        era = era_for(day)
+        era = era_for(day, rules)
         existing_count = existing.get(day.isoformat(), 0)
         location, timezone = location_for(travel, day)
         roles = active_roles(work_history, day)
@@ -709,7 +802,7 @@ def plan_commits(
                     sequence=sequence,
                     total_for_day=count,
                     era=era,
-                    category=note_category(day, era, sequence),
+                    category=note_category(day, era, sequence, rules),
                     location=location,
                     timezone=timezone,
                     roles=roles,
@@ -724,13 +817,14 @@ def day_path(day: date) -> str:
     return f"{day.year:04d}/{day.month:02d}/{day.day:02d}.jsonl"
 
 
-def commit_timestamp(item: PlannedCommit) -> datetime:
-    index = min(item.sequence - 1, len(COMMIT_TIMES) - 1)
-    return datetime.combine(item.day, COMMIT_TIMES[index], tzinfo=ZoneInfo(item.timezone))
+def commit_timestamp(item: PlannedCommit, rules: dict) -> datetime:
+    commit_times = rules["_commit_times"]
+    index = min(item.sequence - 1, len(commit_times) - 1)
+    return datetime.combine(item.day, commit_times[index], tzinfo=ZoneInfo(item.timezone))
 
 
-def record_line(item: PlannedCommit) -> bytes:
-    stamp = commit_timestamp(item)
+def record_line(item: PlannedCommit, rules: dict) -> bytes:
+    stamp = commit_timestamp(item, rules)
     payload = {
         "category": item.category,
         "committed_at": stamp.isoformat(timespec="seconds"),
@@ -859,6 +953,7 @@ def import_history(
     planned: list[PlannedCommit],
     work_history: list[dict] | None = None,
     travel: dict | None = None,
+    rules: dict | None = None,
 ) -> None:
     if not planned:
         raise SystemExit("nothing to import")
@@ -867,6 +962,8 @@ def import_history(
         work_history = load_work_history(Path("work_history.json"))
     if travel is None:
         travel = load_travel(Path("travel_history.json"))
+    if rules is None:
+        rules = load_contribution_rules(Path("contribution_rules.json"))
 
     author_name = git_value(["config", "user.name"], DEFAULT_AUTHOR_NAME)
     author_email = git_value(["config", "user.email"], DEFAULT_AUTHOR_EMAIL)
@@ -883,7 +980,7 @@ def import_history(
     out = process.stdin
 
     for index, item in enumerate(planned):
-        stamp = commit_timestamp(item)
+        stamp = commit_timestamp(item, rules)
         current_metadata_payloads = metadata_snapshots(work_history, travel, item.day)
         metadata_changes = [
             metadata_path
@@ -920,7 +1017,7 @@ def import_history(
                 out.write(file_command(seed_path, Path(seed_path).read_bytes()))
 
         path = day_path(item.day)
-        day_payloads[path] += record_line(item)
+        day_payloads[path] += record_line(item, rules)
         out.write(file_command(path, day_payloads[path]))
         out.write(b"\n")
 
@@ -964,22 +1061,23 @@ def print_summary(planned: list[PlannedCommit], skip_reasons: Counter, real_acti
 
 def main() -> int:
     args = parse_args()
-    start = parse_day(args.start)
-    end = parse_day(args.end)
-    if start < START or end > END:
-        raise SystemExit(f"date range must stay within {START}..{END}")
+    rules = load_contribution_rules(Path(args.rules))
+    start = parse_day(args.start) if args.start else rules["_start"]
+    end = parse_day(args.end) if args.end else rules["_end"]
+    if start < rules["_start"] or end > rules["_end"]:
+        raise SystemExit(f"date range must stay within {rules['_start']}..{rules['_end']}")
     if end < start:
         raise SystemExit("--end must be on or after --start")
 
     existing = load_existing_contributions(Path(args.existing_contributions))
     work_history = load_work_history(Path(args.work_history))
     travel = load_travel(Path(args.travel_history))
-    planned, skip_reasons, real_active_skips = plan_commits(start, end, existing, work_history, travel)
+    planned, skip_reasons, real_active_skips = plan_commits(start, end, existing, work_history, travel, rules)
 
     print_summary(planned, skip_reasons, real_active_skips)
 
     if args.import_history:
-        import_history(planned, work_history, travel)
+        import_history(planned, work_history, travel, rules)
         print("\nimport complete")
     elif not args.dry_run:
         print("\nno import requested; pass --import-history to write Git history")
