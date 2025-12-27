@@ -6,20 +6,21 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import stat
 import subprocess
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 START = date(2010, 1, 3)
 END = date.today()
-DEFAULT_AUTHOR_NAME = "Example Developer"
-DEFAULT_AUTHOR_EMAIL = "developer@example.com"
 REF = "refs/heads/main"
 INITIAL_SEED_FILES = [
     ".gitignore",
@@ -39,6 +40,7 @@ FINAL_TOOLING_FILES = [
 ]
 FINAL_CURRENT_FILES = [*METADATA_FILES, *FINAL_TOOLING_FILES]
 SEED_FILES = [*INITIAL_SEED_FILES, *FINAL_CURRENT_FILES]
+OPTIONAL_TOOLING_FILES = ["LICENSE", "CONTRIBUTING.md", "SECURITY.md"]
 
 
 @dataclass(frozen=True)
@@ -58,8 +60,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start")
     parser.add_argument("--end")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--import-history", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--import-history", action="store_true")
     parser.add_argument("--rules", default="contribution_rules.json")
     parser.add_argument("--existing-contributions", default="existing_contributions.json")
     parser.add_argument("--work-history", default="work_history.json")
@@ -175,12 +178,72 @@ def era_for(day: date, rules: dict) -> str:
 
 
 def load_json(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"cannot load {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"{path} must contain a JSON object")
+    return payload
+
+
+def require_integer(value: object, label: str, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise SystemExit(f"{label} must be an integer >= {minimum}")
+    return value
+
+
+def validate_count_range(value: object, label: str) -> None:
+    if not isinstance(value, list) or len(value) != 2:
+        raise SystemExit(f"{label} must be a [minimum, maximum] pair")
+    low = require_integer(value[0], label)
+    high = require_integer(value[1], label)
+    if high < low:
+        raise SystemExit(f"{label} maximum must be >= minimum")
+
+
+def validate_rule_values(value: object, label: str) -> None:
+    """Check shared scalar/range constraints before density evaluation."""
+    if not isinstance(value, dict):
+        return
+    for key, item in value.items():
+        field = f"{label}.{key}"
+        if key.endswith("probability") or key == "below":
+            if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item) or not 0 <= item <= 1:
+                raise SystemExit(f"{field} must be a probability between 0 and 1")
+        elif key.endswith("probabilities"):
+            if not isinstance(item, list) or not item:
+                raise SystemExit(f"{field} must be a nonempty probability list")
+            for probability in item:
+                validate_rule_values({"probability": probability}, field)
+        elif key in {"count", "weekday_count", "weekend_count"} and isinstance(item, list):
+            validate_count_range(item, field)
+        elif key == "count_ranges":
+            if not isinstance(item, list) or not item:
+                raise SystemExit(f"{field} must be a nonempty list of count pairs")
+            for count_range in item:
+                validate_count_range(count_range, field)
+        elif key in {"base_count", "count", "burst_days", "minimum_generated_total", "minimum_graph_total"}:
+            require_integer(item, field)
+        if isinstance(item, dict):
+            validate_rule_values(item, field)
+        elif isinstance(item, list):
+            for member in item:
+                if isinstance(member, dict):
+                    validate_rule_values(member, field)
+
+
+def validate_timezone(value: str, label: str) -> None:
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, TypeError, ValueError) as exc:
+        raise SystemExit(f"{label} contains an unavailable IANA timezone: {value!r}") from exc
 
 
 def load_contribution_rules(path: Path) -> dict:
     rules = load_json(path)
+    validate_rule_values(rules, str(path))
     date_range = rules.get("date_range", {})
     rules["_start"] = parse_config_day(date_range.get("start", START.isoformat()))
     rules["_end"] = parse_config_day(date_range.get("end", END.isoformat()))
@@ -192,16 +255,40 @@ def load_contribution_rules(path: Path) -> dict:
         existing_activity.get("skip_generated_after", rules["_start"].isoformat())
     )
     rules["_reduce_generated_in_eras"] = set(existing_activity.get("reduce_generated_in_eras", []))
-    rules["_commit_times"] = [parse_config_time(value) for value in rules["commit_times"]]
+    try:
+        rules["_commit_times"] = [parse_config_time(value) for value in rules["commit_times"]]
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise SystemExit(f"{path} commit_times must contain valid HH:MM times") from exc
     if not rules["_commit_times"]:
         raise SystemExit("contribution_rules.json commit_times must not be empty")
+    if rules["_commit_times"] != sorted(rules["_commit_times"]):
+        raise SystemExit(f"{path} commit_times must be in chronological order")
 
     eras = []
+    if not isinstance(rules.get("eras"), list) or not rules["eras"]:
+        raise SystemExit(f"{path} eras must be a nonempty list")
+    names = set()
     for entry in rules["eras"]:
         item = dict(entry)
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip() or name in names:
+            raise SystemExit(f"{path} era names must be nonempty and unique")
+        names.add(name)
         item["_start"] = parse_day(item["start"])
         item["_end"] = parse_day(item["end"]) if item.get("end") else None
+        if item["_end"] is not None and item["_end"] < item["_start"]:
+            raise SystemExit(f"{path} era {name} ends before it starts")
         item.setdefault("note_categories", [item["name"]])
+        categories = item["note_categories"]
+        if not isinstance(categories, list) or not categories or any(not isinstance(category, str) or not category.strip() for category in categories):
+            raise SystemExit(f"{path} era {name} needs nonempty note_categories")
+        density = item.get("density", {})
+        if density.get("type") not in {"college_coursework", "weekend_only", "weekday_project", "year_taper", "assisted_gradient"}:
+            raise SystemExit(f"{path} era {name} has an unsupported density type")
+        if density["type"] == "assisted_gradient":
+            arrays = [density.get(key, []) for key in ("count_ranges", "weekday_probabilities", "quiet_probabilities")]
+            if not arrays[0] or len({len(values) for values in arrays}) != 1:
+                raise SystemExit(f"{path} era {name} gradient arrays must have the same nonzero length")
         eras.append(item)
     eras.sort(key=lambda item: item["_start"])
     previous = None
@@ -214,11 +301,45 @@ def load_contribution_rules(path: Path) -> dict:
                     f"{previous['name']} and {item['name']}"
                 )
         previous = item
+    covered_until = rules["_start"]
+    for item in eras:
+        era_end = item["_end"] or date.max
+        if era_end < covered_until:
+            continue
+        if item["_start"] > covered_until:
+            raise SystemExit(f"{path} eras leave a gap at {covered_until}")
+        if era_end >= rules["_end"]:
+            break
+        covered_until = era_end + timedelta(days=1)
+    else:
+        raise SystemExit(f"{path} eras do not cover date_range.end")
     rules["_eras"] = eras
     rules["_eras_by_name"] = {item["name"]: item for item in eras}
     rules["_annual_total_targets"] = {
-        int(year): int(total) for year, total in rules.get("annual_total_targets", {}).items()
+        int(year): require_integer(total, f"{path} annual_total_targets.{year}")
+        for year, total in rules.get("annual_total_targets", {}).items()
     }
+    for year in rules["_annual_total_targets"]:
+        if not 1 <= year <= 9999:
+            raise SystemExit(f"{path} annual target years must be between 1 and 9999")
+    unknown_eras = rules["_reduce_generated_in_eras"] - names
+    if unknown_eras:
+        raise SystemExit(f"{path} existing_activity references unknown eras: {sorted(unknown_eras)}")
+    rest = rules.get("monthly_rest_days", {})
+    if rest.get("enabled", True) and rest.get("era") and rest["era"] not in names:
+        raise SystemExit(f"{path} monthly_rest_days references an unknown era")
+    minimum = require_integer(rest.get("min_days_per_month", 3), "monthly_rest_days.min_days_per_month")
+    maximum = require_integer(rest.get("max_days_per_month", minimum), "monthly_rest_days.max_days_per_month")
+    if maximum < minimum or maximum > 31:
+        raise SystemExit("monthly_rest_days needs 0 <= minimum <= maximum <= 31")
+    burst = rules.get("annual_bursts", {})
+    target = burst.get("target_count", {})
+    validate_count_range([target.get("min", 10), target.get("max", 12)], "annual_bursts.target_count")
+    gaps = burst.get("minimum_gap_days", [28, 21, 14, 7, 0])
+    if not isinstance(gaps, list) or not gaps:
+        raise SystemExit("annual_bursts.minimum_gap_days must be a nonempty list")
+    for gap in gaps:
+        require_integer(gap, "annual_bursts.minimum_gap_days")
     if "annual_bursts" in rules:
         rules["annual_bursts"]["thresholds"] = sorted(
             rules["annual_bursts"].get("thresholds", []),
@@ -235,7 +356,12 @@ def load_contribution_rules(path: Path) -> dict:
 def load_existing_contributions(path: Path) -> dict[str, int]:
     payload = load_json(path)
     active_days = payload.get("active_days", {})
-    return {str(day): int(count) for day, count in active_days.items()}
+    if not isinstance(active_days, dict):
+        raise SystemExit(f"{path} active_days must be an object")
+    for day, count in active_days.items():
+        parse_day(day)
+        require_integer(count, f"{path} active_days.{day}")
+    return dict(active_days)
 
 
 def load_work_history(path: Path) -> list[dict]:
@@ -244,6 +370,8 @@ def load_work_history(path: Path) -> list[dict]:
         item = dict(entry)
         item["_start"] = parse_day(item["start"])
         item["_end"] = parse_day(item["end"]) if item.get("end") else None
+        if item["_end"] is not None and item["_end"] < item["_start"]:
+            raise SystemExit(f"{path} work-history entry ends before it starts")
         entries.append(item)
     return entries
 
@@ -275,6 +403,7 @@ def active_roles(entries: list[dict], day: date) -> tuple[dict[str, str], ...]:
 
 def load_travel(path: Path) -> dict:
     payload = load_json(path)
+    validate_timezone(payload["default_location"]["timezone"], f"{path} default_location")
     exact = {parse_day(value) for value in payload["exact_travel_dates"]}
     no_generation = [
         (parse_day(item["start"]), parse_day(item["end"]), item["label"])
@@ -292,6 +421,19 @@ def load_travel(path: Path) -> dict:
         }
         for item in payload["location_ranges"]
     ]
+    for start, end, label in [*no_generation, *vacation]:
+        if end < start:
+            raise SystemExit(f"{path} range {label!r} ends before it starts")
+    locations.sort(key=lambda item: item["_start"])
+    previous_end = None
+    for item in locations:
+        validate_timezone(item["timezone"], f"{path} location {item['location']!r}")
+        end = item["_end"] or date.max
+        if end < item["_start"]:
+            raise SystemExit(f"{path} location range ends before it starts")
+        if previous_end is not None and item["_start"] <= previous_end:
+            raise SystemExit(f"{path} location_ranges must not overlap")
+        previous_end = end
     return {
         "default_location": payload["default_location"],
         "exact": exact,
@@ -472,19 +614,29 @@ def annual_quota_counts(
     existing: dict[str, int],
     travel: dict,
     rules: dict,
+    excluded_days: set[date] | None = None,
 ) -> dict[date, int]:
+    """Allocate whole configured years before selecting the requested dates."""
     counts: dict[date, int] = {}
     annual_targets = rules["_annual_total_targets"]
+    if excluded_days is None:
+        excluded_days = set(claude_monthly_vacation_days(
+            max(rules["_start"], date(start.year, 1, 1)),
+            min(rules["_end"], date(end.year, 12, 31)),
+            existing, travel, rules,
+        ))
     existing_by_year: Counter = Counter()
     for day_value, count in existing.items():
         day = parse_day(day_value)
-        if start <= day <= end and day.year in annual_targets:
+        # Targets describe the complete calendar-year graph, even when only
+        # part of that year is eligible for generated history.
+        if day.year in annual_targets:
             existing_by_year[day.year] += int(count)
 
     for year, total_target in annual_targets.items():
-        year_start = max(start, date(year, 1, 1))
-        year_end = min(end, date(year, 12, 31))
-        if year_end < year_start:
+        year_start = max(rules["_start"], date(year, 1, 1))
+        year_end = min(rules["_end"], date(year, 12, 31))
+        if year_end < year_start or year_end < start or year_start > end:
             continue
 
         generated_target = max(0, total_target - existing_by_year[year])
@@ -498,6 +650,7 @@ def annual_quota_counts(
             and vacation_slowdown_reason(travel, day) is None
             and holiday_slowdown_reason(day) is None
             and existing.get(day.isoformat(), 0) == 0
+            and day not in excluded_days
         ]
         candidates.sort(key=lambda item: stable_int(item.isoformat(), "annual-quota-order", 1_000_000))
 
@@ -506,11 +659,18 @@ def annual_quota_counts(
             if remaining <= 0:
                 break
             count = min(quota_day_count(day, rules), remaining)
-            counts[day] = count
+            if start <= day <= end and count > 0:
+                counts[day] = count
             remaining -= count
 
         if remaining > 0:
-            raise SystemExit(f"not enough eligible days to hit {year} target")
+            capacity = generated_target - remaining
+            raise SystemExit(
+                f"cannot meet {year} annual target {total_target}: "
+                f"{existing_by_year[year]} existing contributions require "
+                f"{generated_target} generated commits, but {len(candidates)} eligible days "
+                f"allow only {capacity} after travel, vacation, holiday, and rest exclusions"
+            )
 
     return counts
 
@@ -694,15 +854,22 @@ def claude_monthly_vacation_days(
     if rest_era not in rules["_eras_by_name"]:
         return vacation_days
 
-    rest_start = rules["_eras_by_name"][rest_era]["_start"]
+    era = rules["_eras_by_name"][rest_era]
+    rest_start = max(rules["_start"], era["_start"])
+    rest_end = min(rules["_end"], era["_end"] or date.max)
     first_day = max(start, rest_start)
+    last_day = min(end, rest_end)
+    if first_day > last_day:
+        return vacation_days
     month = date(first_day.year, first_day.month, 1)
-    final_month = date(end.year, end.month, 1)
+    final_month = date(last_day.year, last_day.month, 1)
 
     while month <= final_month:
         month_end = date(month.year + (month.month // 12), (month.month % 12) + 1, 1) - timedelta(days=1)
-        window_start = max(start, rest_start, month)
-        window_end = min(end, month_end)
+        # Select from the full configured month so a shorter preview does not
+        # move rest days into its requested window.
+        window_start = max(rest_start, month)
+        window_end = min(rest_end, month_end)
         month_key = f"{month.year:04d}-{month.month:02d}"
         minimum = int(rest_rules.get("min_days_per_month", 3))
         maximum = int(rest_rules.get("max_days_per_month", minimum))
@@ -710,15 +877,16 @@ def claude_monthly_vacation_days(
         candidates = []
 
         for day in each_day(window_start, window_end):
-            if day == end:
-                continue
             if travel_skip_reason(travel, day) is not None:
                 continue
             if vacation_slowdown_reason(travel, day) is not None:
                 continue
             if existing.get(day.isoformat(), 0) > 0:
                 continue
-            if raw_generated_count(day, rest_era, rules) == 0:
+            if day.year in rules["_annual_total_targets"]:
+                if holiday_slowdown_reason(day) is not None or quota_day_count(day, rules) == 0:
+                    continue
+            elif raw_generated_count(day, rest_era, rules) == 0:
                 continue
             candidates.append(day)
 
@@ -728,7 +896,8 @@ def claude_monthly_vacation_days(
             )
         )
         for day in candidates[:target]:
-            vacation_days[day] = f"{rest_rules.get('label_prefix', 'monthly vacation day')} {month_key}"
+            if start <= day <= end:
+                vacation_days[day] = f"{rest_rules.get('label_prefix', 'monthly vacation day')} {month_key}"
 
         if month.month == 12:
             month = date(month.year + 1, 1, 1)
@@ -752,17 +921,29 @@ def plan_commits(
     real_active_skips: Counter = Counter()
     annual_targets = rules["_annual_total_targets"]
     reduce_eras = rules["_reduce_generated_in_eras"]
-    annual_counts = annual_quota_counts(start, end, existing, travel, rules)
-    monthly_vacation_days = claude_monthly_vacation_days(start, end, existing, travel, rules)
+    # Plan complete configured years before slicing a preview. Annual quotas,
+    # rest days, and burst redistribution must not depend on preview bounds.
+    planning_start = max(rules["_start"], date(start.year, 1, 1))
+    planning_end = min(rules["_end"], date(end.year, 12, 31))
+    monthly_vacation_days = claude_monthly_vacation_days(
+        planning_start, planning_end, existing, travel, rules,
+    )
+    annual_counts = annual_quota_counts(
+        planning_start, planning_end, existing, travel, rules,
+        excluded_days=set(monthly_vacation_days),
+    )
 
-    for day in each_day(start, end):
+    for day in each_day(planning_start, planning_end):
         era = era_for(day, rules)
+        in_requested_range = start <= day <= end
         skip_reason = travel_skip_reason(travel, day)
         if skip_reason:
-            skip_reasons[skip_reason] += 1
+            if in_requested_range:
+                skip_reasons[skip_reason] += 1
             continue
         if day in monthly_vacation_days:
-            skip_reasons[monthly_vacation_days[day]] += 1
+            if in_requested_range:
+                skip_reasons[monthly_vacation_days[day]] += 1
             continue
 
         existing_count = existing.get(day.isoformat(), 0)
@@ -774,18 +955,28 @@ def plan_commits(
             raw_count = raw_generated_count(day, era, rules)
             count = generated_count(day, existing_count, rules)
         slowed_count = apply_vacation_slowdown(day, count, vacation_reason, rules)
-        if vacation_reason and count > 0 and slowed_count == 0:
+        if in_requested_range and vacation_reason and count > 0 and slowed_count == 0:
             skip_reasons[f"{vacation_reason} vacation slowdown"] += 1
         count = slowed_count
-        if day == end and era in reduce_eras and count == 0 and not vacation_reason:
+        if (
+            day == rules["_end"]
+            and day.year not in annual_targets
+            and era in reduce_eras
+            and count == 0
+            and existing_count == 0
+            and not vacation_reason
+            and holiday_slowdown_reason(day) is None
+        ):
             count = 1
-        if day >= rules["_existing_skip_after"] and era not in reduce_eras and existing_count > 0 and raw_count > 0:
+        if in_requested_range and day >= rules["_existing_skip_after"] and era not in reduce_eras and existing_count > 0 and raw_count > 0:
             real_active_skips[era] += 1
         if count == 0:
             continue
         planned_counts[day] = count
 
-    planned_counts = apply_annual_bursts(planned_counts, existing, travel, start, end, rules)
+    planned_counts = apply_annual_bursts(
+        planned_counts, existing, travel, planning_start, planning_end, rules,
+    )
 
     for day in each_day(start, end):
         count = planned_counts.get(day, 0)
@@ -818,8 +1009,11 @@ def day_path(day: date) -> str:
 
 
 def commit_timestamp(item: PlannedCommit, rules: dict) -> datetime:
+    if item.sequence < 1 or item.sequence > item.total_for_day:
+        raise SystemExit(f"invalid commit sequence for {item.day}")
     commit_times = rules["_commit_times"]
     index = min(item.sequence - 1, len(commit_times) - 1)
+    validate_timezone(item.timezone, f"planned commit on {item.day}")
     return datetime.combine(item.day, commit_times[index], tzinfo=ZoneInfo(item.timezone))
 
 
@@ -943,10 +1137,201 @@ def metadata_snapshots(work_history: list[dict], travel: dict, as_of: date) -> d
 
 def ensure_importable() -> None:
     try:
+        root = Path(run_git(["rev-parse", "--show-toplevel"]).strip()).resolve()
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit("run the import from the root of an empty, non-bare Git repository") from exc
+    if root != Path.cwd().resolve():
+        raise SystemExit("run the import from the repository root")
+    if run_git(["for-each-ref", "--format=%(refname)"]).strip():
+        raise SystemExit("refusing to import into a repository with existing refs or history")
+    try:
         run_git(["rev-parse", "--verify", "HEAD"])
     except subprocess.CalledProcessError:
-        return
-    raise SystemExit("refusing to import over an existing commit history")
+        pass
+    else:
+        raise SystemExit("refusing to import over an existing commit history")
+    if run_git(["ls-files", "--stage"]).strip():
+        raise SystemExit("refusing to import with a nonempty Git index; unstage files first")
+
+
+def import_identity() -> tuple[str, str]:
+    name = git_value(["config", "user.name"], "")
+    email = git_value(["config", "user.email"], "")
+    if not name or not email:
+        raise SystemExit("configure git user.name and user.email before importing history")
+    if any(character in name + email for character in "\r\n<>") or "@" not in email or any(character.isspace() for character in email):
+        raise SystemExit("git user.name/user.email must be a valid single-line Git identity")
+    if name in {"Example Developer", "Your Name"} or email.rsplit("@", 1)[-1].lower() in {"example.com", "example.org", "example.net"}:
+        raise SystemExit("replace the placeholder Git identity with your own name and verified GitHub email")
+    return name, email
+
+
+def seed_payloads(input_paths: dict[str, Path] | None = None) -> dict[str, bytes]:
+    sources = {name: Path(name) for name in SEED_FILES}
+    sources.update(input_paths or {})
+    for name in OPTIONAL_TOOLING_FILES:
+        if Path(name).is_file():
+            sources[name] = Path(name)
+    for pattern in (".github/workflows/*.yml", ".github/workflows/*.yaml", "tests/**/*.py", "tests/**/*.json"):
+        for path in Path(".").glob(pattern):
+            if path.is_file():
+                sources[path.as_posix()] = path
+    missing = [str(path) for path in sources.values() if not path.is_file()]
+    if missing:
+        raise SystemExit(f"missing seed files: {', '.join(missing)}")
+    return {name: path.read_bytes() for name, path in sorted(sources.items())}
+
+
+def write_import_stream(
+    out,
+    planned: list[PlannedCommit],
+    work_history: list[dict],
+    travel: dict,
+    rules: dict,
+    seeds: dict[str, bytes],
+    identity: tuple[str, str],
+) -> dict[str, bytes]:
+    """Build the complete stream before any destination repository mutation."""
+    author_name, author_email = identity
+    day_payloads: dict[str, bytes] = defaultdict(bytes)
+    last_metadata_payloads: dict[str, bytes] = {}
+    for index, item in enumerate(planned):
+        stamp = commit_timestamp(item, rules)
+        current_metadata_payloads = metadata_snapshots(work_history, travel, item.day)
+        metadata_changes = [
+            name for name, payload in current_metadata_payloads.items()
+            if last_metadata_payloads.get(name) != payload
+        ]
+        if index == 0:
+            message = f"Initialize contribution notes {item.day.isoformat()}"
+        elif set(metadata_changes) == set(METADATA_FILES):
+            message = f"Update work and travel history {item.day.isoformat()}"
+        elif metadata_changes == ["work_history.json"]:
+            message = f"Update work history {item.day.isoformat()}"
+        elif metadata_changes == ["travel_history.json"]:
+            message = f"Update travel history {item.day.isoformat()}"
+        else:
+            message = f"Record activity {item.day.isoformat()}"
+            if item.sequence > 1:
+                message += f" #{item.sequence}"
+        out.write(f"commit {REF}\n".encode("ascii"))
+        out.write(ident_line("author", author_name, author_email, stamp))
+        out.write(ident_line("committer", author_name, author_email, stamp))
+        out.write(data_block(message.encode("utf-8")))
+        if index == 0:
+            for name in INITIAL_SEED_FILES:
+                out.write(file_command(name, seeds[name]))
+        for name, payload in current_metadata_payloads.items():
+            if last_metadata_payloads.get(name) != payload:
+                out.write(file_command(name, payload))
+                last_metadata_payloads[name] = payload
+        if index == len(planned) - 1:
+            for name, payload in seeds.items():
+                out.write(file_command(name, payload))
+        path = day_path(item.day)
+        day_payloads[path] += record_line(item, rules)
+        out.write(file_command(path, day_payloads[path]))
+        out.write(b"\n")
+    return {**seeds, **day_payloads}
+
+
+def validate_output_paths(payloads: dict[str, bytes], seeds: dict[str, bytes]) -> None:
+    for name in payloads:
+        path = Path(name)
+        for ancestor in (path, *path.parents):
+            if ancestor.is_symlink():
+                raise SystemExit(f"refusing to overwrite or follow a symlink: {ancestor}")
+        if path.exists() and (name not in seeds or not path.is_file()):
+            raise SystemExit(f"generated output would overwrite an existing path: {name}")
+        for parent in path.parents:
+            if parent.exists() and not parent.is_dir():
+                raise SystemExit(f"generated output needs a directory at: {parent}")
+
+
+def replace_output_file(path: Path, payload: bytes, mode: int = 0o644) -> None:
+    """Replace one file atomically, without following links or truncating inodes."""
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".contribution-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+        temporary.chmod(mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def publish_import(temporary_repo: Path, commit: str, payloads: dict[str, bytes], seeds: dict[str, bytes]) -> None:
+    """Install the completed tree, then publish main as the last operation.
+
+    The destination has no refs or tracked files. Preserve unrelated untracked
+    files and restore its original HEAD, index, and seed files on any failure.
+    """
+    ensure_importable()
+    validate_output_paths(payloads, seeds)
+    git_dir = Path(run_git(["rev-parse", "--absolute-git-dir"]).strip())
+    head_path = git_dir / "HEAD"
+    index_path = Path(run_git(["rev-parse", "--git-path", "index"]).strip())
+    original_head = head_path.read_bytes()
+    original_index = index_path.read_bytes() if index_path.exists() else None
+    originals = {
+        name: (Path(name).read_bytes(), stat.S_IMODE(Path(name).stat().st_mode))
+        for name in payloads if Path(name).exists()
+    }
+    created_directories: list[Path] = []
+    written: list[Path] = []
+    try:
+        # The explicit source-only refspec imports objects without creating a ref.
+        run_git(["-c", "gc.auto=0", "-c", "maintenance.auto=false", "fetch", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", str(temporary_repo), REF])
+        ensure_importable()
+        for name, payload in payloads.items():
+            path = Path(name)
+            missing_parents = [parent for parent in path.parents if not parent.exists()]
+            for parent in reversed(missing_parents):
+                parent.mkdir()
+                created_directories.append(parent)
+            replace_output_file(path, payload)
+            written.append(path)
+        run_git(["read-tree", commit])
+        run_git(["symbolic-ref", "HEAD", REF])
+        run_git(["update-ref", REF, commit, "0" * len(commit)])
+    except BaseException as import_error:
+        # A failed ref transaction normally changes nothing. CAS deletion also
+        # covers failures reported after the ref was published by Git.
+        rollback_errors = []
+        try:
+            if git_value(["rev-parse", "--verify", REF], "") == commit:
+                run_git(["update-ref", "-d", REF, commit])
+        except (OSError, subprocess.CalledProcessError) as exc:
+            rollback_errors.append(f"{REF}: {exc}")
+        try:
+            replace_output_file(head_path, original_head)
+        except OSError as exc:
+            rollback_errors.append(f"HEAD: {exc}")
+        try:
+            if original_index is None:
+                index_path.unlink(missing_ok=True)
+            else:
+                replace_output_file(index_path, original_index)
+        except OSError as exc:
+            rollback_errors.append(f"index: {exc}")
+        for path in reversed(written):
+            try:
+                original = originals.get(path.as_posix())
+                if original is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    replace_output_file(path, original[0], original[1])
+            except OSError as exc:
+                rollback_errors.append(f"{path}: {exc}")
+        for directory in reversed(created_directories):
+            try:
+                directory.rmdir()
+            except OSError as exc:
+                rollback_errors.append(f"{directory}: {exc}")
+        if rollback_errors:
+            raise RuntimeError("import failed; rollback needs manual review: " + "; ".join(rollback_errors)) from import_error
+        raise
 
 
 def import_history(
@@ -954,6 +1339,7 @@ def import_history(
     work_history: list[dict] | None = None,
     travel: dict | None = None,
     rules: dict | None = None,
+    input_paths: dict[str, Path] | None = None,
 ) -> None:
     if not planned:
         raise SystemExit("nothing to import")
@@ -964,67 +1350,34 @@ def import_history(
         travel = load_travel(Path("travel_history.json"))
     if rules is None:
         rules = load_contribution_rules(Path("contribution_rules.json"))
-
-    author_name = git_value(["config", "user.name"], DEFAULT_AUTHOR_NAME)
-    author_email = git_value(["config", "user.email"], DEFAULT_AUTHOR_EMAIL)
-    day_payloads: dict[str, bytes] = defaultdict(bytes)
-    last_metadata_payloads: dict[str, bytes] = {}
-
-    missing = [path for path in SEED_FILES if not Path(path).exists()]
-    if missing:
-        raise SystemExit(f"missing seed files: {', '.join(missing)}")
-
-    process = subprocess.Popen(["git", "fast-import", "--quiet"], stdin=subprocess.PIPE)
-    if process.stdin is None:
-        raise SystemExit("failed to open git fast-import stdin")
-    out = process.stdin
-
-    for index, item in enumerate(planned):
-        stamp = commit_timestamp(item, rules)
-        current_metadata_payloads = metadata_snapshots(work_history, travel, item.day)
-        metadata_changes = [
-            metadata_path
-            for metadata_path, payload in current_metadata_payloads.items()
-            if last_metadata_payloads.get(metadata_path) != payload
-        ]
-        if index == 0:
-            message = f"Initialize contribution notes {item.day.isoformat()}"
-        elif set(metadata_changes) == {"work_history.json", "travel_history.json"}:
-            message = f"Update work and travel history {item.day.isoformat()}"
-        elif metadata_changes == ["work_history.json"]:
-            message = f"Update work history {item.day.isoformat()}"
-        elif metadata_changes == ["travel_history.json"]:
-            message = f"Update travel history {item.day.isoformat()}"
-        else:
-            message = f"Record activity {item.day.isoformat()}"
-            if item.sequence > 1:
-                message = f"{message} #{item.sequence}"
-
-        out.write(f"commit {REF}\n".encode("ascii"))
-        out.write(ident_line("author", author_name, author_email, stamp))
-        out.write(ident_line("committer", author_name, author_email, stamp))
-        out.write(data_block(message.encode("utf-8")))
-
-        if index == 0:
-            for seed_path in INITIAL_SEED_FILES:
-                out.write(file_command(seed_path, Path(seed_path).read_bytes()))
-        for metadata_path, payload in current_metadata_payloads.items():
-            if last_metadata_payloads.get(metadata_path) != payload:
-                out.write(file_command(metadata_path, payload))
-                last_metadata_payloads[metadata_path] = payload
-        if index == len(planned) - 1:
-            for seed_path in FINAL_CURRENT_FILES:
-                out.write(file_command(seed_path, Path(seed_path).read_bytes()))
-
-        path = day_path(item.day)
-        day_payloads[path] += record_line(item, rules)
-        out.write(file_command(path, day_payloads[path]))
-        out.write(b"\n")
-
-    out.close()
-    return_code = process.wait()
-    if return_code != 0:
-        raise SystemExit(f"git fast-import failed with exit {return_code}")
+    identity = import_identity()
+    seeds = seed_payloads(input_paths)
+    git_dir = Path(run_git(["rev-parse", "--absolute-git-dir"]).strip())
+    lock_path = git_dir / "contribution-import.lock"
+    try:
+        lock = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise SystemExit(f"another import is running, or a stale lock needs review: {lock_path}") from exc
+    try:
+        with tempfile.TemporaryDirectory(prefix="contribution-history-") as temporary:
+            directory = Path(temporary)
+            stream_path = directory / "history.fi"
+            with stream_path.open("wb") as out:
+                payloads = write_import_stream(out, planned, work_history, travel, rules, seeds, identity)
+            validate_output_paths(payloads, seeds)
+            temporary_repo = directory / "repository.git"
+            environment = os.environ.copy()
+            for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"):
+                environment.pop(key, None)
+            object_format = run_git(["rev-parse", "--show-object-format"]).strip()
+            subprocess.run(["git", "init", "--quiet", "--bare", f"--object-format={object_format}", str(temporary_repo)], check=True, env=environment)
+            with stream_path.open("rb") as stream:
+                subprocess.run(["git", "-C", str(temporary_repo), "fast-import", "--quiet"], stdin=stream, check=True, env=environment)
+            commit = subprocess.check_output(["git", "-C", str(temporary_repo), "rev-parse", REF], text=True, env=environment).strip()
+            publish_import(temporary_repo, commit, payloads, seeds)
+    finally:
+        os.close(lock)
+        lock_path.unlink(missing_ok=True)
 
 
 def print_summary(planned: list[PlannedCommit], skip_reasons: Counter, real_active_skips: Counter) -> None:
@@ -1073,11 +1426,18 @@ def main() -> int:
     work_history = load_work_history(Path(args.work_history))
     travel = load_travel(Path(args.travel_history))
     planned, skip_reasons, real_active_skips = plan_commits(start, end, existing, work_history, travel, rules)
+    for item in planned:
+        commit_timestamp(item, rules)
 
     print_summary(planned, skip_reasons, real_active_skips)
 
     if args.import_history:
-        import_history(planned, work_history, travel, rules)
+        import_history(planned, work_history, travel, rules, {
+            "contribution_rules.json": Path(args.rules),
+            "existing_contributions.json": Path(args.existing_contributions),
+            "work_history.json": Path(args.work_history),
+            "travel_history.json": Path(args.travel_history),
+        })
         print("\nimport complete")
     elif not args.dry_run:
         print("\nno import requested; pass --import-history to write Git history")
@@ -1086,4 +1446,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.CalledProcessError) as exc:
+        sys.exit(f"cannot generate history: {exc}")

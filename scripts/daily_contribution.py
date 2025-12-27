@@ -88,7 +88,7 @@ def graphql(token: str, query: str, variables: dict) -> dict:
     return payload["data"]
 
 
-def contribution_count(token: str, login: str, day: datetime, use_viewer: bool) -> int:
+def contribution_count(token: str, login: str, day: datetime) -> int:
     local_start = datetime.combine(day.date(), time.min, tzinfo=day.tzinfo)
     local_end = datetime.combine(day.date(), time(23, 59, 59), tzinfo=day.tzinfo)
     variables = {
@@ -96,46 +96,26 @@ def contribution_count(token: str, login: str, day: datetime, use_viewer: bool) 
         "to": local_end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
         "login": login,
     }
-    if use_viewer:
-        query = """
-        query($from: DateTime!, $to: DateTime!) {
-          viewer {
-            login
-            contributionsCollection(from: $from, to: $to) {
-              contributionCalendar {
-                weeks {
-                  contributionDays {
-                    date
-                    contributionCount
-                  }
-                }
+    query = """
+    query($login: String!, $from: DateTime!, $to: DateTime!) {
+      user(login: $login) {
+        contributionsCollection(from: $from, to: $to) {
+          contributionCalendar {
+            weeks {
+              contributionDays {
+                date
+                contributionCount
               }
             }
           }
         }
-        """
-        collection = graphql(token, query, variables)["viewer"]["contributionsCollection"]
-    else:
-        query = """
-        query($login: String!, $from: DateTime!, $to: DateTime!) {
-          user(login: $login) {
-            contributionsCollection(from: $from, to: $to) {
-              contributionCalendar {
-                weeks {
-                  contributionDays {
-                    date
-                    contributionCount
-                  }
-                }
-              }
-            }
-          }
-        }
-        """
-        user = graphql(token, query, variables)["user"]
-        if user is None:
-            raise SystemExit(f"GitHub user not found: {login}")
-        collection = user["contributionsCollection"]
+      }
+    }
+    """
+    user = graphql(token, query, variables)["user"]
+    if user is None:
+        raise SystemExit(f"GitHub user not found: {login}")
+    collection = user["contributionsCollection"]
 
     target = day.date().isoformat()
     for week in collection["contributionCalendar"]["weeks"]:
@@ -169,17 +149,14 @@ def main() -> int:
     if now.weekday() in {0, 5, 6} and stable_percentage(now.date().isoformat(), "quiet-safety-net") >= 35:
         return no_change(f"quiet safety-net day: {now.date().isoformat()}")
 
-    token = os.getenv("GH_CONTRIBUTIONS_TOKEN")
-    use_viewer = bool(token)
-    if not token:
-        token = os.getenv("GITHUB_TOKEN", "")
+    token = os.getenv("GH_CONTRIBUTIONS_TOKEN") or os.getenv("GITHUB_TOKEN", "")
     if not token:
         raise SystemExit("missing GH_CONTRIBUTIONS_TOKEN or GITHUB_TOKEN")
 
     login = os.getenv("CONTRIBUTION_LOGIN") or os.getenv("GITHUB_REPOSITORY_OWNER", "")
     if not login:
         raise SystemExit("missing CONTRIBUTION_LOGIN or GITHUB_REPOSITORY_OWNER")
-    count = contribution_count(token, login, now, use_viewer)
+    count = contribution_count(token, login, now)
     if count > 0:
         return no_change(f"{now.date().isoformat()} already has {count} contribution(s)")
 

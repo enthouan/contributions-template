@@ -1,11 +1,26 @@
 # Contributions Template
 
-Generate a deterministic private contribution-history repository from work and
-travel notes.
+[Read the article: Activity is not productivity](https://www.antoinemenard.com/articles/activity-is-not-productivity/)
+
+Generate a deterministic, synthetic contribution-history repository from work
+and travel notes. The generated commits are timeline records, not evidence of
+software shipped or productivity.
 
 This repo is the reusable template and setup guide. Keep it as a small tooling
 repo. The generated contribution history should live in a separate empty private
 repository, for example `yourname/contributions`.
+
+## Requirements
+
+- Python 3.10 or newer, with an IANA timezone database available to `zoneinfo`.
+  The scripts and tests use only the Python standard library.
+- Git 2.29 or newer and `rsync` for the setup commands below, on macOS or Linux.
+- A GitHub account and Git authentication for pushing the output repository.
+- The [GitHub CLI](https://cli.github.com/) (`gh auth login`) if you use the
+  variable, secret, and workflow commands below.
+
+No package installation is needed on a system with Python and timezone data.
+Minimal Linux images may need their operating system's `tzdata` package.
 
 ## How To Set Up This Repo
 
@@ -44,6 +59,8 @@ rsync -av \
   --exclude .git \
   --exclude __pycache__ \
   --exclude '*/__pycache__' \
+  --exclude .venv \
+  --exclude '.env*' \
   ./ ../contributions/
 ```
 
@@ -52,6 +69,18 @@ From this point on, run setup commands from the output repo:
 ```sh
 cd ../contributions
 ```
+
+Set the identity used for the initial generated commits:
+
+```sh
+git config user.name "Your Name"
+git config user.email "YOUR_GITHUB_LINKED_EMAIL"
+```
+
+Use an email connected to your GitHub account or your GitHub-provided `noreply`
+address. The generator refuses to import without a configured name and email;
+the workflow variables configured later do not set this local Git identity.
+See [GitHub's contribution attribution requirements](https://docs.github.com/en/account-and-profile/how-tos/contribution-settings/troubleshooting-missing-contributions).
 
 Check that the output repo still has no commits before importing history:
 
@@ -160,6 +189,15 @@ start by editing these sections:
 - `annual_bursts`: deterministic 10-12 commit spike days for busy years.
 - `monthly_rest_days`: random-looking rest days in the assisted-coding era.
 - `commit_times`: local author times used for multi-commit days.
+
+Annual targets describe the complete calendar-year total. Generated commits are
+allocated only within that year's intersection with `date_range`; all supplied
+existing activity for the year counts, including outside `date_range`. A shorter
+`--start`/`--end` preview selects that portion of the same yearly plan; it does not
+compress the whole target into the preview. If existing activity already meets
+or exceeds the target, no additional commits are generated for that year. An
+impossible target fails with an error instead of silently producing a smaller
+total.
 
 The generator supports these density types:
 
@@ -349,8 +387,12 @@ If GitHub already shows real activity for your account, fetch a baseline first.
 The generator uses this file to skip or reduce generated commits on dates that
 already have real contributions.
 
-Create a GitHub personal access token that can read your contribution calendar,
-then export it locally:
+Create a GitHub personal access token for the account whose calendar you are
+checking, then export it locally. For a classic token, the `read:user` scope
+allows private/internal contributions to be included, as documented by
+[GitHub's ContributionsCollection API](https://docs.github.com/en/graphql/reference/users#contributionscollection).
+These calendar queries do not require repository write access; pushing uses
+your separately configured Git authentication.
 
 ```sh
 export GH_CONTRIBUTIONS_TOKEN=ghp_your_token_here
@@ -362,7 +404,12 @@ Fetch existing contribution counts:
 python3 scripts/fetch_existing_contributions.py --login YOUR_LOGIN
 ```
 
-This writes `existing_contributions.json`.
+This fetches the requested range in windows of at most 365 days and writes
+`existing_contributions.json` only after all requests succeed. Use `--start` and
+`--end` to cover your intended timeline; the default starts on `2014-05-01`.
+For years with annual targets, fetch the full calendar year, including activity
+outside the generation range (through today for the current year), so it can all
+count toward the target.
 
 If you do not want to fetch a baseline, leave the included
 `existing_contributions.json` in place. It contains an empty `active_days` map.
@@ -386,19 +433,41 @@ Import into the current empty repository:
 python3 generate_history.py --import-history
 ```
 
+The import validates the plan, builds history in a temporary repository, and
+then installs it into the empty output repository on `main`. Existing history,
+staged files, and conflicting output files are rejected. Alternate inputs passed
+with `--rules`, `--work-history`, `--travel-history`, or
+`--existing-contributions` are saved under the canonical filenames in the final
+commit. Unrelated untracked files remain untouched.
+
+`--dry-run` and `--import-history` are mutually exclusive. After a successful
+import, inspect the result before pushing:
+
+```sh
+git status --short
+git log -5 --format=fuller
+python3 -m unittest discover -s tests -v
+```
+
+The standard setup leaves a clean checkout. Custom input files kept alongside
+the template may still appear as untracked files.
+
 Push:
 
 ```sh
 git push -u origin main
 ```
 
-If GitHub does not update the profile graph immediately, wait. Contribution
-indexing is not instant.
+Ensure `main` is the output repository's default branch. To display anonymized
+counts from a private output repository, enable **Private contributions** under
+your profile's **Contribution settings** ([GitHub instructions](https://docs.github.com/en/account-and-profile/how-tos/contribution-settings/manage-visibility-settings-for-private-contributions-and-achievements)).
+Qualifying commits can take up to 24 hours to appear; check the author email and
+default branch if they remain missing.
 
 ### Step 4: Enable The Daily Safety Net
 
 The optional workflow keeps the graph warm after the generated range. It is
-manual-only in this template so GitHub Actions does not run automatically.
+manual-only in this template so the daily workflow does not run automatically.
 Enable scheduled runs only in the generated output repo, after the initial
 history has been pushed.
 
@@ -424,6 +493,21 @@ contribution activity before creating a safety-net commit:
 
 ```sh
 gh secret set GH_CONTRIBUTIONS_TOKEN
+```
+
+Use a token with `read:user` access to the configured account as described above.
+The script always checks `CONTRIBUTION_LOGIN`, regardless of which token is used.
+Without this secret, it uses the workflow's `GITHUB_TOKEN`, whose view of private
+activity outside the output repository is limited. The workflow commits with its
+own `contents: write` permission, not with the calendar token.
+
+If you enabled the schedule, commit and push the workflow change from the output
+repository so GitHub receives it:
+
+```sh
+git add .github/workflows/daily-contribution.yml
+git commit -m "enable daily contribution schedule"
+git push
 ```
 
 Run it manually once:
@@ -467,3 +551,21 @@ before they could reasonably be known.
 - Do not paste GitHub tokens into chat, commits, or JSON files.
 - After generation, review `git log --stat`, yearly counts, and a few travel
   periods before pushing.
+
+## Development And Contributions
+
+Run the regression suite from the repository root:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+Tests use mocked calendar responses and disposable Git repositories. CI runs
+them on Linux and macOS, including the minimum supported Python version.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and
+[SECURITY.md](SECURITY.md) for private vulnerability reports.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE). The generator retains
+the license with the tooling in the output repository.

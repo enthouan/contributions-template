@@ -1,0 +1,386 @@
+{
+  "source": "Synthetic rules fixture for regression tests; independent of user configuration.",
+  "date_range": {
+    "start": "2010-01-03",
+    "end": "2026-12-31"
+  },
+  "existing_activity": {
+    "skip_generated_after": "2014-05-01",
+    "reduce_generated_in_eras": [
+      "assisted_coding"
+    ]
+  },
+  "commit_times": [
+    "12:00",
+    "13:13",
+    "14:37",
+    "16:04",
+    "17:42",
+    "19:03",
+    "20:26",
+    "21:49",
+    "22:12",
+    "22:47",
+    "23:11",
+    "23:34"
+  ],
+  "holiday_slowdown": {
+    "thanksgiving_active_probability": 0.18,
+    "christmas_new_year_active_probability": 0.1
+  },
+  "vacation_slowdown": {
+    "default_active_probability": 0.14,
+    "deep_vacation_active_probability": 0.1,
+    "deep_vacation_keywords": [
+      "honeymoon",
+      "vacation"
+    ]
+  },
+  "eras": [
+    {
+      "name": "college",
+      "start": "2010-01-03",
+      "end": "2014-04-30",
+      "note_categories": [
+        "coursework",
+        "lab",
+        "project",
+        "debugging"
+      ],
+      "density": {
+        "type": "college_coursework",
+        "holiday_gap": {
+          "weekday_probability": 0.12,
+          "weekend_probability": 0.05,
+          "active_salt": "college-holiday"
+        },
+        "summer_months": [
+          6,
+          7,
+          8
+        ],
+        "summer": {
+          "weekday_probability": 0.5,
+          "weekend_probability": 0.22,
+          "weekday_count": [
+            1,
+            3
+          ],
+          "weekend_count": [
+            1,
+            3
+          ],
+          "active_salt": "college-summer",
+          "count_salt": "college-summer-count"
+        },
+        "term": {
+          "weekday_probability": 0.84,
+          "weekend_probability": 0.34,
+          "weekday_count": [
+            1,
+            4
+          ],
+          "weekend_count": [
+            1,
+            3
+          ],
+          "active_salt": "college-term",
+          "count_salt": "college-term-count"
+        }
+      }
+    },
+    {
+      "name": "post_college_weekend",
+      "start": "2014-05-01",
+      "end": "2015-12-31",
+      "note_categories": [
+        "portfolio",
+        "mobile-notes",
+        "maintenance"
+      ],
+      "density": {
+        "type": "weekend_only",
+        "active_probability": 0.23,
+        "count": [
+          1,
+          3
+        ],
+        "active_salt": "post-college-weekend",
+        "count_salt": "post-college-count"
+      }
+    },
+    {
+      "name": "intense_project",
+      "start": "2016-01-01",
+      "end": "2019-03-31",
+      "note_categories": [
+        "feature-work",
+        "integration",
+        "prototype",
+        "release-notes"
+      ],
+      "density": {
+        "type": "weekday_project",
+        "weekday": {
+          "active_probability": 0.7,
+          "count": [
+            2,
+            4
+          ],
+          "active_salt": "intense-weekday-primary",
+          "count_salt": "intense-weekday-primary-count"
+        },
+        "weekend": {
+          "active_probability": 0.18,
+          "count": [
+            1,
+            3
+          ],
+          "active_salt": "intense-weekend-occasional",
+          "count_salt": "intense-weekend-occasional-count"
+        }
+      }
+    },
+    {
+      "name": "management_taper",
+      "start": "2019-04-01",
+      "end": "2024-06-30",
+      "note_categories": [
+        "maintenance",
+        "tooling",
+        "reading-notes"
+      ],
+      "density": {
+        "type": "year_taper",
+        "active_salt": "management-taper",
+        "count_salt": "management-count",
+        "years": {
+          "2019": {
+            "weekend_probability": 0.07,
+            "weekday_probability": 0.24,
+            "count": [
+              1,
+              3
+            ]
+          },
+          "2020": {
+            "weekend_probability": 0.18,
+            "weekday_probability": 0.13,
+            "count": [
+              1,
+              2
+            ]
+          },
+          "2021": {
+            "weekend_probability": 0.18,
+            "weekday_probability": 0.02,
+            "count": [
+              1,
+              2
+            ]
+          },
+          "2022": {
+            "weekend_probability": 0.12,
+            "weekday_probability": 0.01,
+            "count": [
+              1,
+              1
+            ]
+          },
+          "2023": {
+            "weekend_probability": 0.07,
+            "weekday_probability": 0.0,
+            "count": [
+              1,
+              1
+            ]
+          },
+          "2024": {
+            "weekend_probability": 0.05,
+            "weekday_probability": 0.0,
+            "count": [
+              1,
+              1
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "quiet_gap",
+      "start": "2024-07-01",
+      "end": "2025-05-31",
+      "note_categories": [
+        "maintenance",
+        "archive"
+      ],
+      "density": {
+        "type": "weekend_only",
+        "active_probability": 0.05,
+        "count": [
+          1,
+          1
+        ],
+        "active_salt": "quiet-gap",
+        "count_salt": "quiet-gap-count"
+      }
+    },
+    {
+      "name": "assisted_coding",
+      "start": "2025-06-01",
+      "note_categories": [
+        "agent-workflow",
+        "automation",
+        "prompt-systems",
+        "tooling",
+        "code-assist"
+      ],
+      "density": {
+        "type": "assisted_gradient",
+        "quiet_weekdays": [
+          0,
+          5,
+          6
+        ],
+        "weekday_probabilities": [
+          0.55,
+          0.65,
+          0.72,
+          0.8,
+          0.86,
+          0.9
+        ],
+        "quiet_probabilities": [
+          0.18,
+          0.24,
+          0.3,
+          0.34,
+          0.38,
+          0.4
+        ],
+        "count_ranges": [
+          [
+            2,
+            5
+          ],
+          [
+            3,
+            6
+          ],
+          [
+            3,
+            7
+          ],
+          [
+            4,
+            8
+          ],
+          [
+            5,
+            9
+          ],
+          [
+            5,
+            9
+          ]
+        ],
+        "quiet_count_adjustment": {
+          "low_delta": -1,
+          "high_delta": -2,
+          "minimum_low": 2
+        },
+        "active_salt": "assisted-gradient-active",
+        "count_salt": "assisted-gradient-count"
+      }
+    }
+  ],
+  "annual_total_targets": {
+    "2021": 240,
+    "2022": 240,
+    "2023": 240,
+    "2024": 260
+  },
+  "annual_quota": {
+    "default": {
+      "base_count": 1,
+      "second_probability": 0.52,
+      "third_probability": 0.16,
+      "second_salt": "annual-quota-second",
+      "third_salt": "annual-quota-third"
+    },
+    "year_overrides": {
+      "2022": {
+        "salt": "annual-quota-2022-burst",
+        "bands": [
+          {
+            "below": 0.12,
+            "count": 4
+          },
+          {
+            "below": 0.34,
+            "count": 3
+          },
+          {
+            "below": 0.68,
+            "count": 2
+          },
+          {
+            "count": 1
+          }
+        ]
+      }
+    }
+  },
+  "annual_bursts": {
+    "enabled": true,
+    "minimum_generated_total": 200,
+    "minimum_graph_total": 220,
+    "thresholds": [
+      {
+        "minimum_graph_total": 500,
+        "burst_days": 5
+      },
+      {
+        "minimum_graph_total": 350,
+        "burst_days": 4
+      },
+      {
+        "minimum_graph_total": 220,
+        "burst_days": 3
+      }
+    ],
+    "target_count": {
+      "min": 10,
+      "max": 12,
+      "salt": "annual-burst-target"
+    },
+    "candidate_salt": "annual-burst-candidate",
+    "donor_salt_prefix": "annual-burst-donor",
+    "fallback_salt_prefix": "annual-burst-fallback",
+    "weekday_penalties": {
+      "0": 420000,
+      "1": 0,
+      "2": 0,
+      "3": 0,
+      "4": 0,
+      "5": 620000,
+      "6": 220000
+    },
+    "minimum_gap_days": [
+      28,
+      21,
+      14,
+      7,
+      0
+    ]
+  },
+  "monthly_rest_days": {
+    "enabled": true,
+    "era": "assisted_coding",
+    "min_days_per_month": 3,
+    "max_days_per_month": 4,
+    "count_salt": "claude-monthly-vacation-count",
+    "day_salt": "claude-monthly-vacation-day",
+    "label_prefix": "monthly vacation day"
+  }
+}
